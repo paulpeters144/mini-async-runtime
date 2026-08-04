@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+mio = { version = "0.8", features = ["os-poll", "net"] }
+log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11"
