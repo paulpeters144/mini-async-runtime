@@ -3,6 +3,20 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
+// A `Waker` is an opaque handle to whatever needs to be re-polled. It is
+// delivered to futures through `Context` (see `Task::poll`). But `Waker` is a
+// zero-sized type: it only carries a raw pointer to "waker data" plus a vtable
+// of functions for cloning, waking and dropping that data. So to *create* a
+// waker you must supply those pieces yourself via `RawWaker` + `RawWakerVTable`.
+//
+// Why not use a ready-made waker? The standard `Waker` is designed for
+// multi-threaded runtimes: it requires its payload to be `Send + Sync`, and
+// sharing state across threads is normally done with `Arc`. Our runtime is
+// single-threaded by design, so all shared state lives in an `Rc<RefCell<_>>`
+// (see `RuntimeState`). `Arc` would add overhead and force `Send + Sync`
+// requirements we don't need. So we hand-build the raw waker so that the
+// payload can be an `Rc` instead of an `Arc`; this keeps the runtime `!Send`
+// by design (a threading boundary is added only in Phase 3 of the plan).
 struct WakerData {
     shared: Rc<RefCell<RuntimeState>>,
     id: usize,
