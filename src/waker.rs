@@ -1,10 +1,10 @@
-use crate::shared::Shared;
+use crate::runtime_state::RuntimeState;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
 struct WakerData {
-    shared: Rc<RefCell<Shared>>,
+    shared: Rc<RefCell<RuntimeState>>,
     id: usize,
 }
 
@@ -32,7 +32,7 @@ fn drop_raw(data: *const ()) {
     drop(unsafe { Rc::from_raw(data as *const WakerData) });
 }
 
-pub fn create_waker(shared: Rc<RefCell<Shared>>, id: usize) -> Waker {
+pub fn create_waker(shared: Rc<RefCell<RuntimeState>>, id: usize) -> Waker {
     let data = Rc::new(WakerData { shared, id });
     let ptr = Rc::into_raw(data) as *const ();
     unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) }
@@ -50,7 +50,7 @@ pub fn create_waker(shared: Rc<RefCell<Shared>>, id: usize) -> Waker {
 // and confirm the id shows up in the queue exactly once.
 #[test]
 fn wake_push_id() {
-    let shared = Shared::new();
+    let shared = RuntimeState::new();
     let waker = create_waker(shared.clone(), 7);
     waker.wake();
     assert_eq!(shared.borrow().queue, [7]);
@@ -62,7 +62,7 @@ fn wake_push_id() {
 // Here we wake twice from the same waker and expect two entries in the queue.
 #[test]
 fn wake_by_ref_twice() {
-    let shared = Shared::new();
+    let shared = RuntimeState::new();
     let waker = create_waker(shared.clone(), 7);
     waker.wake_by_ref();
     waker.wake_by_ref();
@@ -76,7 +76,7 @@ fn wake_by_ref_twice() {
 // point at id 7, and waking through either one reaches the same queue.
 #[test]
 fn cloned_waker_works() {
-    let shared = Shared::new();
+    let shared = RuntimeState::new();
     let waker = create_waker(shared.clone(), 7);
     let c = waker.clone();
     c.wake();
@@ -94,7 +94,7 @@ fn cloned_waker_works() {
 // was cleaned up exactly once.
 #[test]
 fn refcount_stays_balanced() {
-    let shared = Shared::new();
+    let shared = RuntimeState::new();
     let data = Rc::new(WakerData { shared, id: 1 });
     assert_eq!(Rc::strong_count(&data), 1);
 

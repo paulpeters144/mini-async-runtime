@@ -41,7 +41,7 @@ A **lib crate** so integration tests in `tests/` compile against the public API 
 ```
 src/
   lib.rs        # re-exports: Runtime, spawn, sleep, yield_now, spawn_blocking, ...
-  shared.rs     # Shared { queue, tasks, next_id, blocking } — the id-map + ready queue
+  runtime_state.rs # RuntimeState { queue, tasks, next_id, blocking } — the id-map + ready queue
   task.rs       # Task { id, future }
   waker.rs      # RawWakerVTable boilerplate, create_waker(), WakerData
   executor.rs   # Runtime: spawn() + run(), the 3-phase loop
@@ -86,7 +86,7 @@ Every trace line carries the task id; grepping one id across the log tells the w
   - In contrast, a **stale id** popped off the ready queue that's no longer in the task map → *skip silently*. That's legitimate (a future woke itself then completed) and must not panic.
 - Rationale: reading one `run()?` path end-to-end in `main` is clearer for a learning project than panic-on-everything, and the `?` marks every point where the OS can actually say no.
 
-**Task panics (locked in):** if a spawned future panics mid-poll, the panic **propagates out of `run()`**. No `catch_unwind`. Rationale: catching it mid-drain leaves `Shared` in an uncertain state, and for a learning runtime a panic is the loudest, most debuggable failure mode. (One test asserts exactly this: a panicking task makes `run()` panic.)
+**Task panics (locked in):** if a spawned future panics mid-poll, the panic **propagates out of `run()`**. No `catch_unwind`. Rationale: catching it mid-drain leaves `RuntimeState` in an uncertain state, and for a learning runtime a panic is the loudest, most debuggable failure mode. (One test asserts exactly this: a panicking task makes `run()` panic.)
 
 ---
 
@@ -121,7 +121,7 @@ The pointer is an `Rc<WakerData>` leaked into `*const ()`, where `WakerData` bun
 ```rust
 // --- Models ---
 
-struct Shared { /* see section 3 */
+struct RuntimeState { /* see section 3 */
     queue: VecDeque<usize>,
     tasks: HashMap<usize, Task>,
     next_id: usize,
@@ -130,7 +130,7 @@ struct Shared { /* see section 3 */
 
 // The type-erased payload behind a `RawWaker`.
 struct WakerData {
-    shared: Rc<RefCell<Shared>>,
+    shared: Rc<RefCell<RuntimeState>>,
     id: usize,
 }
 
@@ -143,19 +143,19 @@ fn wake_raw(data: *const ());
 fn wake_by_ref_raw(data: *const ());
 fn drop_raw(data: *const ());
 
-fn create_waker(shared: Rc<RefCell<Shared>>, id: usize) -> Waker;
+fn create_waker(shared: Rc<RefCell<RuntimeState>>, id: usize) -> Waker;
 ```
 
 **Key insight:** `wake` only pushes the `id` into the queue — the future itself stays parked in the task table until the executor polls it. That's why the waker needs `WakerData`, not the `Task` itself.
 
 ---
 
-## 3. The Shared State (Ready Queue + Task Table)
+## 3. RuntimeState (Ready Queue + Task Table)
 
 Standardizing on pure `Rc` collapses the "ready queue" into one shared structure owned by the runtime:
 
 ```rust
-struct Shared {
+struct RuntimeState {
     queue: VecDeque<usize>,      // the ready queue: ids of tasks able to make progress
     tasks: HashMap<usize, Task>, // every live task, keyed by id
     next_id: usize,              // spawn counter (mio::Token(id) maps 1:1)
@@ -163,7 +163,7 @@ struct Shared {
 }
 ```
 
-All three (four, in Phase 3) live behind a single `Rc<RefCell<Shared>>` handed to spawners, wakers, and the executor.
+All three (four, in Phase 3) live behind a single `Rc<RefCell<RuntimeState>>` handed to spawners, wakers, and the executor.
 
 - **`queue: VecDeque<usize>`** — Tasks are **not** pushed here by value; only their ids. When a task is newly spawned, or when an OS event / timer fires, its id gets enqueued.
 - **`tasks: HashMap<usize, Task>`** — The future stays parked here between polls. The executor *removes* a task by id, polls it, and **re-inserts it if it returns `Pending`**. If it returns `Ready`, the task is dropped (done). Because `Pin<Box<dyn Future>>` pins only the heap allocation, this move-in/move-out of the map is safe.
@@ -199,7 +199,7 @@ The **Reactor** monitors file descriptors (sockets, pipes, timers) using the OS'
 A `sleep()` future doesn't register anything with the OS. Instead, when first polled, it pushes `(deadline, task_id)` into a shared wheel and stores its waker:
 
 ```rust
-// Shared, same Rc family as `Shared`
+// Same `Rc` family as `RuntimeState`
 type TimerWheel = Rc<RefCell<BinaryHeap<Reverse<(Instant, usize)>>>>;
 //                       priority keyed by deadline, so `peek()` = earliest
 ```
@@ -222,7 +222,7 @@ The **deadline is the contract between the timer future and the executor:**
 Everything `tests/` (and the demo `main`) uses is exactly this:
 
 ```rust
-pub struct Runtime { /* shared: Rc<RefCell<Shared>>, wheel, poll, events, registry, pool (P3) */ }
+pub struct Runtime { /* shared: Rc<RefCell<RuntimeState>>, wheel, poll, events, registry, pool (P3) */ }
 
 impl Runtime {
     pub fn new() -> io::Result<Self>;                                  // mio::Poll::new()
@@ -246,14 +246,14 @@ where F: FnOnce() -> R + Send + 'static, R: Send + 'static;
 
 Two mechanisms, both `#[cfg(test)]`:
 
-1. **Probe future** (`src/shared.rs` or a `src/testutil.rs`): a test future that
+1. **Probe future** (`src/runtime_state.rs` or a `src/testutil.rs`): a test future that
    - records how many times it was polled,
    - captures `cx.waker().clone()` so a test can fire it manually,
    - can be told to return `Pending` N times then `Ready`,
    - can *wake itself* on a chosen poll (to exercise the stale-id path).
    This is the workhorse for waker and re-poll tests without any timing or I/O.
 
-2. **State getters** on `Shared` + the wheel, exposed `#[cfg(test)]` only:
+2. **State getters** on `RuntimeState` + the wheel, exposed `#[cfg(test)]` only:
    - `queue_len()` / `task_count()` / `wheel_len()` / `pending_ids()` — assert invariants directly,
    - `Rc::strong_count(...)` assertions after dropping a waker — catches the classic `Rc` leak where a leaked waker keeps a task alive forever (the #1 failure mode of manual vtables). If strong_count isn't back to the baseline, the test fails red: your `drop_raw` (or `wake_by_ref_raw`) is buggy.
 
@@ -295,9 +295,9 @@ The **Executor** is the main `loop` running on your single thread. It coordinate
 
 ### The 3-Phase Loop Execution:
 
-1. **Drain Phase:** Pop task ids from the Ready Queue one by one. Resolve each id in `Shared::tasks` (skip if missing — stale wake), construct a `Context` from the task's `Waker`, and call `task.future.poll(&mut context)`. `Pending` → re-insert into the task map; `Ready` → drop the task (done).
+1. **Drain Phase:** Pop task ids from the Ready Queue one by one. Resolve each id in `RuntimeState::tasks` (skip if missing — stale wake), construct a `Context` from the task's `Waker`, and call `task.future.poll(&mut context)`. `Pending` → re-insert into the task map; `Ready` → drop the task (done).
 2. **Park / Sleep Phase:** When the Ready Queue is empty, compute the timeout from the **Timer Wheel** (`earliest deadline - now`, or `None` = block forever) and call `mio::Poll::poll(&mut events, timeout)`. The thread sleeps until I/O activity *or* the earliest timer fires.
-3. **Dispatch + Expire Phase:** (a) Loop through the returned `mio::Events`; for each `mio::Token`, look up the matching `Waker` in the Reactor registry and call `waker.wake()` — this pushes ids into the Ready Queue. The reserved `WAKEN` token (Phase 3) means a worker finished: wake *every* waker in `Shared::blocking` instead. (b) Drain the Timer Wheel of all due deadlines and enqueue those ids too.
+3. **Dispatch + Expire Phase:** (a) Loop through the returned `mio::Events`; for each `mio::Token`, look up the matching `Waker` in the Reactor registry and call `waker.wake()` — this pushes ids into the Ready Queue. The reserved `WAKEN` token (Phase 3) means a worker finished: wake *every* waker in `RuntimeState::blocking` instead. (b) Drain the Timer Wheel of all due deadlines and enqueue those ids too.
 
 ### Termination condition
 
@@ -318,22 +318,22 @@ where
     R: Send + 'static,
 ```
 
-**The rule of the boundary:** everything on the executor thread stays pure `Rc`/`!Send` (memory-model note, top of this plan). The *only* `Send` things in the crate are what must cross threads: the job closure, its result, and the channels carrying them. **Workers never touch `Shared`** — not by `Rc`, not by reference, not at all. They see exactly two things: the job channel and a `mio::Waker`.
+**The rule of the boundary:** everything on the executor thread stays pure `Rc`/`!Send` (memory-model note, top of this plan). The *only* `Send` things in the crate are what must cross threads: the job closure, its result, and the channels carrying them. **Workers never touch `RuntimeState`** — not by `Rc`, not by reference, not at all. They see exactly two things: the job channel and a `mio::Waker`.
 
 **Components:**
 
 - `WorkerPool { job_tx: mpsc::Sender<Job>, workers: Vec<JoinHandle<()>> }` — a fixed pool (default **1 worker thread**; a `Vec` you can size later). Each worker loops `job_rx.recv()`, runs the closure, and calls the shared `mio::Waker`. Workers exit when the channel closes.
 - `mio::Waker` — registered once on the reactor `Poll` under a reserved `WAKEN` token (e.g. `Token(usize::MAX)`). It is the one object workers hold (`Send` + `Clone`). Its entire job: after a job finishes, `wake()` makes the executor's blocked `Poll::poll(timeout)` return *immediately* with the `WAKEN` token. Without it, the executor could park on `None` forever while a worker is mid-read.
 - `BlockingTask<R>` — a future, the mirror of `Sleep` (same id/waker discipline, same `Drop` cleanup):
-  1. **First poll:** allocate a `blocking_id`, create `(tx, rx) = std::sync::mpsc::channel::<R>()`, wrap the closure so it runs `f()` and sends the result through `tx`, push the job onto `job_tx`, save `cx.waker()` in `Shared::blocking[blocking_id]`, return `Pending`.
-  2. **Later polls:** `rx.try_recv()` — **never blocks, which is the whole point**. Result in → `Ready(result)` and remove the `Shared::blocking` entry. Not yet → re-arm the waker, stay `Pending`.
-  3. **`Drop`:** remove `Shared::blocking[blocking_id]` — the same cancellation discipline as the timer `Drop` trap (section 5). A task that abandons its `BlockingTask` must not leave a stale waker behind.
+  1. **First poll:** allocate a `blocking_id`, create `(tx, rx) = std::sync::mpsc::channel::<R>()`, wrap the closure so it runs `f()` and sends the result through `tx`, push the job onto `job_tx`, save `cx.waker()` in `RuntimeState::blocking[blocking_id]`, return `Pending`.
+  2. **Later polls:** `rx.try_recv()` — **never blocks, which is the whole point**. Result in → `Ready(result)` and remove the `RuntimeState::blocking` entry. Not yet → re-arm the waker, stay `Pending`.
+  3. **`Drop`:** remove `RuntimeState::blocking[blocking_id]` — the same cancellation discipline as the timer `Drop` trap (section 5). A task that abandons its `BlockingTask` must not leave a stale waker behind.
 
 **The wake path (two hops: worker → thread → tasks):**
 
 1. Worker finishes → sends the result through `tx` → calls its `mio::Waker::wake()`.
 2. The executor's `Poll::poll` returns with the `WAKEN` token (not a timeout, not an I/O event).
-3. Executor dispatches `WAKEN`: for every `(id, waker)` in `Shared::blocking`, call `waker.wake()` → ids land on the ready queue.
+3. Executor dispatches `WAKEN`: for every `(id, waker)` in `RuntimeState::blocking`, call `waker.wake()` → ids land on the ready queue.
 4. Re-polled `BlockingTask`s `try_recv()` their results and complete.
 
 Waking *all* pending blocking tasks on `WAKEN` is slightly wasteful but trivially correct — blocking tasks are expected to be few. Optimize later if ever needed.
@@ -342,7 +342,7 @@ Waking *all* pending blocking tasks on `WAKEN` is slightly wasteful but triviall
 
 **Panic in a worker closure:** the worker runs the closure under `std::panic::catch_unwind` and sends the panic payload back through `tx` rather than letting it die on the worker thread. `BlockingTask` then `std::panic::resume_unwind`s it on the next poll — so the panic propagates out of `run()` exactly like any task panic (Error Handling policy). A panicking closure can never hang the task that awaits it.
 
-**Termination & shutdown:** `run()` additionally requires `Shared::blocking.is_empty()` before returning — a task parked on a worker is still outstanding work. On `Runtime` drop, close `job_tx`, let the workers drain the channel and exit, and `join` their handles. No worker threads leak.
+**Termination & shutdown:** `run()` additionally requires `RuntimeState::blocking.is_empty()` before returning — a task parked on a worker is still outstanding work. On `Runtime` drop, close `job_tx`, let the workers drain the channel and exit, and `join` their handles. No worker threads leak.
 
 **Trace points:** `submit_blocking(id={id})`, `worker_done(id={id})`, `waken(token=WAKEN, pending={n})`.
 
@@ -350,7 +350,7 @@ Waking *all* pending blocking tasks on `WAKEN` is slightly wasteful but triviall
 - The milestone: spawn `spawn_blocking(|| std::fs::read_to_string(big_file))` **and** a `sleep(50ms)` task; assert the sleep fires while the worker is still reading. This is the direct, observable proof that other futures run while a worker blocks.
 - Round-trip: the `BlockingTask` yields exactly the value the closure returned.
 - Two concurrent `spawn_blocking` calls both complete (two workers in flight at once).
-- Cancellation: a task that starts `spawn_blocking` then abandons it leaves `Shared::blocking` empty after `run()`.
+- Cancellation: a task that starts `spawn_blocking` then abandons it leaves `RuntimeState::blocking` empty after `run()`.
 - Shutdown: after `run()`, every worker thread has exited (assert via `JoinHandle` completion / pool thread count).
 - `spawn_blocking` called from *inside* a task (thread-local free fn, same as `spawn`).
 - Worker panic: a panicking closure makes `run()` panic — never hang.
@@ -394,7 +394,7 @@ fn main() -> io::Result<()> {
 Each step is: **write the failing test → make it pass → refactor.** Tests live in `#[cfg(test)]` modules *next to* the code, and integration tests that exercise the whole `run()` loop live in `tests/`.
 
 1. Define the `Task` struct (`id` + `future`). *Test:* unit test for `next_id` monotonicity once spawn exists; nothing else to test yet — this step is mostly scaffolding.
-2. Build the shared state: `Rc<RefCell<Shared>>` with queue, task map, and id counter. *Test:* push/pop the queue, insert/remove a task from the map, ids never repeat.
+2. Build the shared state: `Rc<RefCell<RuntimeState>>` with queue, task map, and id counter. *Test:* push/pop the queue, insert/remove a task from the map, ids never repeat.
 3. Implement the manual `RawWakerVTable` + `create_waker(shared, id)`. *Test (the one that teaches the most):* create a waker, clone it a few times, assert the shared `Rc` refcount goes up, `waker.wake()` enqueues the right id, and dropping everything brings refcount back to 1. Also assert the stale-id-skip path doesn't panic.
 4. Write the Executor core (spawn + `run()`), **poll-only** — drain loop + block-on-empty, no timers, no reactor yet. *Tests:* a trivial `async {}` completes; a future returning `Pending` once then `Ready` is re-polled when its waker is fired manually. (Executor parks with a long fixed timeout here; refactor to the wheel in step 6.)
 5. Add the Timer Wheel + `sleep()` future + the `yield_now()` primitive. *Tests:* `sleep(0)` completes; elapsed time of a `sleep(50ms)` task ≥ 50ms; two concurrent `sleep`s complete in ~max(durations); a `sleep` woken early still completes correctly; a long `sleep` cancelled early leaves the wheel empty (the `Drop` test); `yield_now()` returns Pending exactly once and is re-polled via wake-self.
@@ -411,7 +411,7 @@ Each step is: **write the failing test → make it pass → refactor.** Tests li
 ## Build Order — Phase 3 (`spawn_blocking` + workers, deferred)
 
 12. Build `WorkerPool` in isolation (pure `std`, no runtime): a job channel + N worker threads, each `recv` → run → drop. *Tests:* a worker runs a closure and the result is observable; workers exit when the channel closes (no thread leaks).
-13. Add `BlockingTask` + the `WAKEN` wake path. *Tests:* the milestone — `spawn_blocking(read big file)` interleaves with a `sleep(50ms)` task; round-trip value correctness; two concurrent `spawn_blocking`s both complete; a cancelled `BlockingTask` leaves `Shared::blocking` empty (the Phase 3 `Drop` test).
+13. Add `BlockingTask` + the `WAKEN` wake path. *Tests:* the milestone — `spawn_blocking(read big file)` interleaves with a `sleep(50ms)` task; round-trip value correctness; two concurrent `spawn_blocking`s both complete; a cancelled `BlockingTask` leaves `RuntimeState::blocking` empty (the Phase 3 `Drop` test).
 14. Worker panic semantics: `catch_unwind` in the worker, ship the payload through the result channel, `resume_unwind` on the task's next poll. *Test:* a panicking closure makes `run()` panic — never hang.
 15. Finalize shutdown: close the job channel and join the workers on `Runtime` drop. *Test:* after `run()`, every worker thread has exited.
 
@@ -427,7 +427,7 @@ These are the properties the whole test suite exists to protect. If one breaks, 
 4. **The executor never parks with work pending.** If the queue or wheel has live entries, it keeps draining — the park timeout is the *earliest* deadline, and wake paths enqueue ids it must see. *Checked by:* concurrency demo timing assertions.
 5. **Termination is total.** After `run()`, queue, task map, wheel, and (Phase 3) the blocking map are all empty — nothing stranded. *Checked by:* state getters in every integration test's final assertion.
 6. **No silent I/O mistriage.** An unmatched event token panics rather than being dropped (Phase 2). *Checked by:* the Phase 2 dispatch test.
-7. **The blocking boundary is sealed (Phase 3).** Workers never touch `Shared` — they see only the job channel and the `mio::Waker`. Results cross back through `mpsc`; nothing `!Send` ever leaves the executor thread. *Checked by:* the `BlockingTask` round-trip test + the fact that `WorkerPool` compiles without any reference to `Shared`.
+7. **The blocking boundary is sealed (Phase 3).** Workers never touch `RuntimeState` — they see only the job channel and the `mio::Waker`. Results cross back through `mpsc`; nothing `!Send` ever leaves the executor thread. *Checked by:* the `BlockingTask` round-trip test + the fact that `WorkerPool` compiles without any reference to `RuntimeState`.
 8. **A worker result is never lost or hung on.** A completed closure always produces a wake (`WAKEN`), and a panicking closure sends its panic back instead of vanishing. *Checked by:* the worker-panic test and the interleave test.
 
 ## Verification Workflow (day-to-day)

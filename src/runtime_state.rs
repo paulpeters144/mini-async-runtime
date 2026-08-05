@@ -3,15 +3,15 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-pub struct Shared {
+pub struct RuntimeState {
     pub queue: VecDeque<usize>,
     pub tasks: HashMap<usize, Task>,
     pub next_id: usize,
 }
 
-impl Shared {
+impl RuntimeState {
     pub fn new() -> Rc<RefCell<Self>> {
-        Rc::new(RefCell::new(Shared {
+        Rc::new(RefCell::new(RuntimeState {
             queue: VecDeque::new(),
             tasks: HashMap::new(),
             next_id: 0,
