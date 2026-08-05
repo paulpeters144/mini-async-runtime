@@ -1,5 +1,6 @@
 use crate::runtime_state::RuntimeState;
 use crate::task::Task;
+use crate::timer_wheel::{self, TimerWheel};
 use crate::waker::create_waker;
 use std::cell::RefCell;
 use std::future::Future;
@@ -7,11 +8,11 @@ use std::io::{self};
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-#[derive(Default)]
 pub struct Runtime {
     state: Rc<RefCell<RuntimeState>>,
+    wheel: TimerWheel,
 }
 
 const PARK_TIMEOUT: Duration = Duration::from_millis(100);
@@ -19,7 +20,8 @@ const PARK_TIMEOUT: Duration = Duration::from_millis(100);
 impl Runtime {
     pub fn new() -> Self {
         let state = RuntimeState::new();
-        Runtime { state }
+        let wheel = Rc::new(RefCell::new(std::collections::BinaryHeap::new()));
+        Runtime { state, wheel }
     }
 
     pub fn spawn<F>(&mut self, future: F)
@@ -34,6 +36,8 @@ impl Runtime {
     }
 
     pub fn run(&mut self) -> io::Result<()> {
+        timer_wheel::install(self.wheel.clone());
+
         loop {
             loop {
                 let next = {
@@ -50,6 +54,7 @@ impl Runtime {
                     None => continue,
                 };
 
+                timer_wheel::set_current_id(id);
                 let waker = create_waker(self.state.clone(), id);
                 let mut cx = Context::from_waker(&waker);
                 match task.poll(&mut cx) {
@@ -58,12 +63,40 @@ impl Runtime {
                     }
                     Poll::Ready(()) => {}
                 }
+                timer_wheel::clear_current_id();
             }
-            if self.state.borrow().tasks.is_empty() {
+
+            let done = {
+                let state = self.state.borrow();
+                let wheel = self.wheel.borrow();
+                state.tasks.is_empty() && wheel.is_empty()
+            };
+            if done {
                 return Ok(());
             }
-            thread::sleep(PARK_TIMEOUT);
+
+            let timeout = timer_wheel::next_deadline(&self.wheel)
+                .map(|deadline| {
+                    let now = Instant::now();
+                    if deadline > now {
+                        deadline - now
+                    } else {
+                        Duration::ZERO
+                    }
+                })
+                .unwrap_or(PARK_TIMEOUT);
+            thread::sleep(timeout);
+
+            for id in timer_wheel::expire_due(&self.wheel) {
+                self.state.borrow_mut().queue.push_back(id);
+            }
         }
+    }
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

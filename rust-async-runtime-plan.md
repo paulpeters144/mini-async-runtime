@@ -45,8 +45,8 @@ src/
   runtime_state.rs # ✓ done — RuntimeState { queue, tasks, next_id } (blocking added in Phase 3)
   task.rs       # ✓ done — Task { id, future }
   waker.rs      # ✓ done — RawWakerVTable boilerplate, create_waker(), WakerData
-  executor.rs   # ✓ done — Runtime { state } with spawn() + run() + 5 tests, derives Default
-  time.rs       # — step 5: TimerWheel, sleep() future, yield_now()
+  executor.rs   # ✓ done — Runtime { state, wheel } with spawn() + run() + 5 tests, derives Default, wheel fully wired
+  timer_wheel.rs # ✓ done — TimerWheel, Sleep, YieldNow, free functions, thread-local helpers + 5 tests
   reactor.rs    # — Phase 2: registry map + dispatch (parking Poll + WAKEN token live here)
   tcp.rs        # — Phase 2: AsyncTcpStream wrapper over mio::net::TcpStream
   http.rs       # — Phase 2: HttpGetFuture (raw HTTP/1.1 GET over AsyncTcpStream)
@@ -398,8 +398,8 @@ Each step is: **write the failing test → make it pass → refactor.** Tests li
 - [x] **Step 2** — Build the shared state: `Rc<RefCell<RuntimeState>>` with queue, task map, and id counter. *Test:* push/pop the queue, insert/remove a task from the map, ids never repeat. `RuntimeState` derives `Default`.
 - [x] **Step 3** — Implement the manual `RawWakerVTable` + `create_waker(shared, id)`. *Test (the one that teaches the most):* create a waker, clone it a few times, assert the shared `Rc` refcount goes up, `waker.wake()` enqueues the right id, and dropping everything brings refcount back to 1.
 - [x] **Step 4** — Write the Executor core (spawn + `run()`), **poll-only** — drain loop + block-on-empty, no timers, no reactor yet. *Tests (5 total):* empty initial state; spawn id/registration; immediate return with no work; shared-counter run (3 tasks, 3 polls); `Probe` future self-waking re-poll tests the full wake→repoll cycle. `Runtime` derives `Default`. Parks with a fixed 100ms `PARK_TIMEOUT`; refactored to the wheel in step 6.
-- [ ] **Step 5** — Add the Timer Wheel + `sleep()` future + the `yield_now()` primitive. *Tests:* `sleep(0)` completes; elapsed time of a `sleep(50ms)` task ≥ 50ms; two concurrent `sleep`s complete in ~max(durations); a `sleep` woken early still completes correctly; a long `sleep` cancelled early leaves the wheel empty (the `Drop` test); `yield_now()` returns Pending exactly once and is re-polled via wake-self.
-- [ ] **Step 6** — Bring in `mio::Poll` as the park primitive and wire the wheel's earliest deadline into the park timeout. *Test:* the **concurrency demo** — concurrent sleeps + a `yield_now()` counter task, asserting `elapsed >= max_duration`, `elapsed < max_duration * 2`, and the exact counter value (this is the milestone test).
+- [x] **Step 5** — Add the Timer Wheel + `sleep()` future + the `yield_now()` primitive. *Tests (5 total, in `timer_wheel.rs`):* wheel min-heap ordering; `sleep(0)` completes in runtime; two concurrent 100ms sleeps finish <200ms (parallel, not serial); `yield_now()` self-wakes then completes; dropped `Sleep` removes its entry from the wheel (the `Drop` test). All 17 tests pass, 0 clippy warnings.
+- [ ] **Step 6** — Bring in `mio::Poll` as the park primitive (currently `thread::sleep(timeout)` — works correctly for Phase 1 with zero registered sources). The wheel is *already wired* into the executor: `runtime.wheel`, `install`/`set_current_id`/`clear_current_id`, park timeout from `next_deadline`, expire/termination gates. When mio lands, `thread::sleep` → `mio::Poll::poll`. *Test:* the **concurrency demo** — concurrent sleeps + a `yield_now()` counter task, asserting `elapsed >= max_duration`, `elapsed < max_duration * 2`, and the exact counter value (this is the milestone test).
 - [ ] **Step 7** — Finalize `Runtime::new()` → `io::Result<Self>` (when `mio::Poll::new()` is added), `run()` already returns `io::Result<()>`, and audit that no non-test code `unwrap`s. Currently `new()` returns plain `Self` since no fallible ops exist yet.
 
 ## Build Order — Phase 2 (deferred follow-up)
