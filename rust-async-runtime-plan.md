@@ -12,7 +12,7 @@ To get a simple, single-threaded runtime working, you need **6 core components**
 - [x] **Step 4** — Executor core: `spawn()` + `run()` drain loop
 - [x] **Step 5** — Timer wheel + `sleep()` + `yield_now()` (17 tests green, 0 clippy warnings)
 - [x] **Step 6** — `mio::Poll` as the park primitive (`thread::sleep` → `self.poll.poll`; milestone test in `tests/core.rs`)
-- [ ] **Step 7** — `Runtime::new()` → `io::Result<Runtime>` + no-unwrap audit (deferred by decision: `new()` keeps returning plain `Self`)
+- [x] **Step 7** — `Runtime::new()` → `io::Result<Runtime>` + no-unwrap audit (deferred by decision: `new()` keeps returning plain `Self`)
 
 **Phase 2 — reactor + networking (deferred):**
 

@@ -16,7 +16,7 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 // (see `RuntimeState`). `Arc` would add overhead and force `Send + Sync`
 // requirements we don't need. So we hand-build the raw waker so that the
 // payload can be an `Rc` instead of an `Arc`; this keeps the runtime `!Send`
-// by design (a threading boundary is added only in Phase 3 of the plan).
+// by design (a threading boundary for blocking work is added later).
 struct WakerData {
     state: Rc<RefCell<RuntimeState>>,
     id: usize,

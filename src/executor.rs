@@ -1,3 +1,4 @@
+use crate::reactor::{self, Reactor, ReactorHandle};
 use crate::runtime_state::RuntimeState;
 use crate::task::Task;
 use crate::timer_wheel::{self, TimerWheel};
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 pub struct Runtime {
     state: Rc<RefCell<RuntimeState>>,
     wheel: TimerWheel,
-    poll: mio::Poll,
+    reactor: ReactorHandle,
     events: mio::Events,
 }
 
@@ -20,12 +21,12 @@ impl Runtime {
     pub fn new() -> Self {
         let state = RuntimeState::new();
         let wheel = Rc::new(RefCell::new(std::collections::BinaryHeap::new()));
-        let poll = mio::Poll::new().unwrap();
+        let reactor = Rc::new(RefCell::new(Reactor::new()));
         let events = mio::Events::with_capacity(64);
         Runtime {
             state,
             wheel,
-            poll,
+            reactor,
             events,
         }
     }
@@ -43,6 +44,7 @@ impl Runtime {
 
     pub fn run(&mut self) -> io::Result<()> {
         timer_wheel::install(self.wheel.clone());
+        reactor::install(self.reactor.clone());
 
         loop {
             loop {
@@ -75,7 +77,8 @@ impl Runtime {
             let done = {
                 let state = self.state.borrow();
                 let wheel = self.wheel.borrow();
-                state.tasks.is_empty() && wheel.is_empty()
+                let reactor = self.reactor.borrow();
+                state.tasks.is_empty() && wheel.is_empty() && reactor.is_empty()
             };
             if done {
                 return Ok(());
@@ -90,11 +93,13 @@ impl Runtime {
                         Duration::ZERO
                     }
                 });
-            self.poll.poll(&mut self.events, timeout)?;
+            self.reactor.borrow_mut().park(&mut self.events, timeout)?;
 
             for id in timer_wheel::expire_due(&self.wheel) {
                 self.state.borrow_mut().queue.push_back(id);
             }
+
+            reactor::dispatch(&self.reactor, &self.events);
         }
     }
 }
@@ -108,7 +113,13 @@ impl Default for Runtime {
 #[cfg(test)]
 use std::cell::Cell;
 #[cfg(test)]
+use std::io::{Read, Write};
+#[cfg(test)]
 use std::pin::Pin;
+#[cfg(test)]
+use std::thread;
+#[cfg(test)]
+use mio::{Interest, Token};
 
 // The runtime is the thing that makes futures progress. `new()` is just
 // allocation: an empty `RuntimeState` with an empty queue and no task map. A
@@ -156,7 +167,7 @@ fn run_returns_immediately_when_nothing_is_spawned() {
 // its last — it reports `Ready` and the executor drops it. Three spawned tasks
 // are each polled once and disposed of, so after `run()` the shared counter
 // equals the number of tasks, and both queue and map are empty: nothing is
-// stranded (the plan's invariant: "termination is total").
+// stranded (the invariant "termination is total").
 #[test]
 fn run_completes_spawned_tasks_and_leaves_empty_state() {
     let polls = Rc::new(Cell::new(0usize));
@@ -182,7 +193,7 @@ fn run_completes_spawned_tasks_and_leaves_empty_state() {
 // its id back onto the queue *during* the drain, so the executor's loop keeps
 // running and re-polls it. When `Probe` finally returns `Ready`, the task is
 // dropped and the map empties, so `run()` can return. This is the golden-rule
-// test of step 4: it proves the executor re-polls a `Pending` task after a
+// test that proves the executor re-polls a `Pending` task after a
 // wake, which is the whole point of a waker-driven loop.
 #[cfg(test)]
 struct Probe {
@@ -220,4 +231,75 @@ fn probe_future_re_polls_until_ready() {
     let state = runtime.state.borrow();
     assert!(state.queue.is_empty());
     assert!(state.tasks.is_empty());
+}
+
+// A task parked on a socket: the I/O analogue of `Sleep`. On its first
+// `WouldBlock` poll it reaches the shared reactor through the thread-local
+// `reactor::with` accessor, registering the read end with the poller and
+// storing its waker under the token; returning `Pending` makes the executor
+// park the thread. A write on the other end of the socket pair — from another
+// thread — fires the readiness event; `dispatch` calls the stored waker, which
+// re-queues the task; the next poll finds the bytes, deregisters, and
+// completes. The task is then dropped, the reactor empties, and `run()` can
+// return. The whole reactor in one `run()` call.
+#[cfg(test)]
+struct Readable {
+    rx: mio::net::UnixStream,
+    token: mio::Token,
+    registered: bool,
+}
+
+#[cfg(test)]
+impl Future for Readable {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let mut buf = [0u8; 16];
+        match this.rx.read(&mut buf) {
+            Ok(_) => {
+                reactor::with(|reactor| {
+                    let _ = reactor.deregister_source(&mut this.rx, this.token);
+                });
+                Poll::Ready(())
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if !this.registered {
+                    reactor::with(|reactor| {
+                        reactor
+                            .register_source(&mut this.rx, this.token, Interest::READABLE)
+                            .unwrap();
+                    });
+                    this.registered = true;
+                }
+                reactor::with(|reactor| reactor.register(this.token, cx.waker().clone()));
+                Poll::Pending
+            }
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+}
+
+#[test]
+fn run_wakes_a_task_parked_on_io_readiness() {
+    let (tx, rx) = mio::net::UnixStream::pair().unwrap();
+    let mut runtime = Runtime::new();
+    runtime.spawn(Readable {
+        rx,
+        token: Token(7),
+        registered: false,
+    });
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        let mut tx = tx;
+        tx.write_all(b"x").unwrap();
+    });
+
+    runtime.run().expect("run should not fail");
+
+    let state = runtime.state.borrow();
+    assert!(state.queue.is_empty());
+    assert!(state.tasks.is_empty());
+    assert!(runtime.reactor.borrow().is_empty());
 }

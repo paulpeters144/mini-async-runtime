@@ -319,7 +319,7 @@ mod tests {
         assert!(flag.get());
     }
 
-    // The "cancellation trap" (Section 5 of the plan): when a `Sleep` future
+    // The "cancellation trap": when a `Sleep` future
     // is dropped before its deadline, its `Drop` impl must remove the
     // `(deadline, id)` entry from the shared wheel.  Otherwise a stale entry
     // blocks the termination check (`wheel.is_empty()`) forever.  This test
