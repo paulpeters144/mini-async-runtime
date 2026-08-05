@@ -2,6 +2,26 @@ Building a minimal, single-threaded async runtime using only `mio` and `std` is 
 
 To get a simple, single-threaded runtime working, you need **6 core components** (the async I/O wrapper you build on top is the 7th).
 
+### Status — Phase 1/2/3 (build-order steps below)
+
+```text
+[x] Define the Task struct (id + future), monotonic next_id
+[x] Build shared state: Rc<RefCell<RuntimeState>> with queue, task map, id counter
+[x] Implement manual RawWakerVTable + create_waker(shared, id) with refcount tests
+[x] Write Executor core (spawn + run()), poll-only drain loop, 5 tests, 100ms PARK_TIMEOUT
+[ ] Add Timer Wheel + sleep() future + yield_now() primitive (6 tests)
+[ ] Bring in mio::Poll as park primitive + wire wheel deadline + concurrency demo
+[ ] Finalize Runtime::new() -> io::Result<Self>; audit no non-test unwraps
+[ ] Reactor dispatch: UnixStream::pair() + token->waker registry
+[ ] AsyncTcpStream wrapper (WouldBlock -> register + store waker + Pending)
+[ ] HttpGetFuture: raw HTTP/1.1 GET over AsyncTcpStream
+[ ] Echo demo: concurrent reader + writer tasks over socket pair
+[ ] Build WorkerPool in isolation (job channel + N worker threads)
+[ ] Add BlockingTask + WAKEN wake path (Phase 3 milestone)
+[ ] Worker panic semantics: catch_unwind / resume_unwind on next poll
+[ ] Finalize shutdown: close job channel + join workers on Runtime drop
+```
+
 > **Memory model decision (locked in, with one deliberate exception):** Pure `Rc` for **all runtime state on the executor thread**. The entire runtime — every future, the ready queue, the timer wheel, the reactor registry — is `!Send` and lives on one thread. No `Arc`, no `Mutex`, no channels *on the executor side*. This keeps the Waker vtable as simple as possible and the `Send`/`Sync` question disappears for everything the executor touches. **The single exception is the Phase 3 `spawn_blocking` boundary (section 7):** a worker thread must receive a closure and hand back a result, which requires `std::sync::mpsc` channels + a `mio::Waker` — the only `Send` types in the whole crate. Everything else stays `!Send`. (Trade-off: the *executor* can never grow into a multi-threaded scheduler — that's fine, that's the point. Workers offload blocking work; they never poll futures.)
 
 ---
