@@ -18,7 +18,7 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 // payload can be an `Rc` instead of an `Arc`; this keeps the runtime `!Send`
 // by design (a threading boundary is added only in Phase 3 of the plan).
 struct WakerData {
-    shared: Rc<RefCell<RuntimeState>>,
+    state: Rc<RefCell<RuntimeState>>,
     id: usize,
 }
 
@@ -34,20 +34,20 @@ fn clone_raw(data: *const ()) -> RawWaker {
 
 fn wake_raw(data: *const ()) {
     let data = unsafe { Rc::from_raw(data as *const WakerData) };
-    data.shared.borrow_mut().queue.push_back(data.id);
+    data.state.borrow_mut().queue.push_back(data.id);
 }
 
 fn wake_by_raw_ref(data: *const ()) {
     let data = unsafe { &*(data as *const WakerData) };
-    data.shared.borrow_mut().queue.push_back(data.id);
+    data.state.borrow_mut().queue.push_back(data.id);
 }
 
 fn drop_raw(data: *const ()) {
     drop(unsafe { Rc::from_raw(data as *const WakerData) });
 }
 
-pub fn create_waker(shared: Rc<RefCell<RuntimeState>>, id: usize) -> Waker {
-    let data = Rc::new(WakerData { shared, id });
+pub fn create_waker(state: Rc<RefCell<RuntimeState>>, id: usize) -> Waker {
+    let data = Rc::new(WakerData { state, id });
     let ptr = Rc::into_raw(data) as *const ();
     unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) }
 }
@@ -64,10 +64,10 @@ pub fn create_waker(shared: Rc<RefCell<RuntimeState>>, id: usize) -> Waker {
 // and confirm the id shows up in the queue exactly once.
 #[test]
 fn wake_push_id() {
-    let shared = RuntimeState::new();
-    let waker = create_waker(shared.clone(), 7);
+    let state = RuntimeState::new();
+    let waker = create_waker(state.clone(), 7);
     waker.wake();
-    assert_eq!(shared.borrow().queue, [7]);
+    assert_eq!(state.borrow().queue, [7]);
 }
 
 // `wake_by_ref` takes `&self` instead of consuming the waker, so one waker can
@@ -76,11 +76,11 @@ fn wake_push_id() {
 // Here we wake twice from the same waker and expect two entries in the queue.
 #[test]
 fn wake_by_ref_twice() {
-    let shared = RuntimeState::new();
-    let waker = create_waker(shared.clone(), 7);
+    let state = RuntimeState::new();
+    let waker = create_waker(state.clone(), 7);
     waker.wake_by_ref();
     waker.wake_by_ref();
-    assert_eq!(shared.borrow().queue, [7, 7]);
+    assert_eq!(state.borrow().queue, [7, 7]);
 }
 
 // Wakers are cheap to clone: a clone does NOT copy the data, it adds one more
@@ -90,12 +90,12 @@ fn wake_by_ref_twice() {
 // point at id 7, and waking through either one reaches the same queue.
 #[test]
 fn cloned_waker_works() {
-    let shared = RuntimeState::new();
-    let waker = create_waker(shared.clone(), 7);
+    let state = RuntimeState::new();
+    let waker = create_waker(state.clone(), 7);
     let c = waker.clone();
     c.wake();
     waker.wake_by_ref();
-    assert_eq!(shared.borrow().queue, [7, 7]);
+    assert_eq!(state.borrow().queue, [7, 7]);
 }
 
 // The trickiest part of a waker is memory: every `Rc::into_raw` leaks one
@@ -108,8 +108,8 @@ fn cloned_waker_works() {
 // was cleaned up exactly once.
 #[test]
 fn refcount_stays_balanced() {
-    let shared = RuntimeState::new();
-    let data = Rc::new(WakerData { shared, id: 1 });
+    let state = RuntimeState::new();
+    let data = Rc::new(WakerData { state, id: 1 });
     assert_eq!(Rc::strong_count(&data), 1);
 
     let waker = unsafe {

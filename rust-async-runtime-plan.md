@@ -2,6 +2,32 @@ Building a minimal, single-threaded async runtime using only `mio` and `std` is 
 
 To get a simple, single-threaded runtime working, you need **6 core components** (the async I/O wrapper you build on top is the 7th).
 
+## Progress at a Glance (full details in each phase's Build Order below)
+
+**Phase 1 — runtime core + timers (current):**
+
+- [x] **Step 1** — `Task` wrapper (`id` + `Pin<Box<dyn Future>>`)
+- [x] **Step 2** — `RuntimeState` (ready queue + task map + `next_id`)
+- [x] **Step 3** — Manual `RawWakerVTable` + `create_waker`
+- [x] **Step 4** — Executor core: `spawn()` + `run()` drain loop
+- [x] **Step 5** — Timer wheel + `sleep()` + `yield_now()` (17 tests green, 0 clippy warnings)
+- [ ] **Step 6** — `mio::Poll` as the park primitive (today: `thread::sleep(timeout)`)
+- [ ] **Step 7** — `Runtime::new()` → `io::Result<Runtime>` + no-unwrap audit
+
+**Phase 2 — reactor + networking (deferred):**
+
+- [ ] **Step 8** — Reactor dispatch
+- [ ] **Step 9** — `AsyncTcpStream`
+- [ ] **Step 10** — `HttpGetFuture`
+- [ ] **Step 11** — Echo demo
+
+**Phase 3 — `spawn_blocking` (deferred):**
+
+- [ ] **Step 12** — `WorkerPool`
+- [ ] **Step 13** — `BlockingTask` + `WAKEN`
+- [ ] **Step 14** — Panic semantics
+- [ ] **Step 15** — Shutdown
+
 
 > **Memory model decision (locked in, with one deliberate exception):** Pure `Rc` for **all runtime state on the executor thread**. The entire runtime — every future, the ready queue, the timer wheel, the reactor registry — is `!Send` and lives on one thread. No `Arc`, no `Mutex`, no channels *on the executor side*. This keeps the Waker vtable as simple as possible and the `Send`/`Sync` question disappears for everything the executor touches. **The single exception is the Phase 3 `spawn_blocking` boundary (section 7):** a worker thread must receive a closure and hand back a result, which requires `std::sync::mpsc` channels + a `mio::Waker` — the only `Send` types in the whole crate. Everything else stays `!Send`. (Trade-off: the *executor* can never grow into a multi-threaded scheduler — that's fine, that's the point. Workers offload blocking work; they never poll futures.)
 
@@ -41,7 +67,7 @@ A **lib crate** so integration tests in `tests/` compile against the public API 
 
 ```
 src/
-  lib.rs        # ✓ done — re-exports: Runtime, RuntimeState, Task, waker
+  lib.rs        # ✓ done — `pub mod` declarations for every module below
   runtime_state.rs # ✓ done — RuntimeState { queue, tasks, next_id } (blocking added in Phase 3)
   task.rs       # ✓ done — Task { id, future }
   waker.rs      # ✓ done — RawWakerVTable boilerplate, create_waker(), WakerData
@@ -52,13 +78,15 @@ src/
   http.rs       # — Phase 2: HttpGetFuture (raw HTTP/1.1 GET over AsyncTcpStream)
   blocking.rs   # — Phase 3: WorkerPool, BlockingTask, spawn_blocking()
 tests/
-  core.rs       # — spawn + run integration tests (the milestone demo lives here)
+  core.rs       # — NOT YET CREATED: step 6's concurrency demo (the milestone test) lives here
   blocking.rs   # — Phase 3: worker/interleave integration tests (file-read milestone)
 ```
 
 Each module carries `#[cfg(test)] mod tests` for its own unit tests; `tests/core.rs` is the black-box acceptance suite.
 
 ### Trace points (via `log` + `env_logger`)
+
+> **Status:** the `log`/`env_logger` deps are declared in `Cargo.toml`, but no `log::` statements exist in the code yet. Tracing lands with Step 6/8 when the park + dispatch phases get real code.
 
 `RUST_LOG=trace` should show the full wake cycle so a red test pinpoints the bug:
 
@@ -131,7 +159,7 @@ struct RuntimeState {
 
 // The type-erased payload behind a `RawWaker`.
 struct WakerData {
-    shared: Rc<RefCell<RuntimeState>>,
+    state: Rc<RefCell<RuntimeState>>,
     id: usize,
 }
 
@@ -144,7 +172,7 @@ fn wake_raw(data: *const ());
 fn wake_by_ref_raw(data: *const ());
 fn drop_raw(data: *const ());
 
-fn create_waker(shared: Rc<RefCell<RuntimeState>>, id: usize) -> Waker;
+fn create_waker(state: Rc<RefCell<RuntimeState>>, id: usize) -> Waker;
 ```
 
 **Key insight:** `wake` only pushes the `id` into the queue — the future itself stays parked in the task table until the executor polls it. That's why the waker needs `WakerData`, not the `Task` itself.
@@ -223,7 +251,7 @@ The **deadline is the contract between the timer future and the executor:**
 Everything `tests/` (and the demo `main`) uses is exactly this:
 
 ```rust
-pub struct Runtime { /* state: Rc<RefCell<RuntimeState>>; derives Default. wheel, poll, ... added in later steps */ }
+pub struct Runtime { /* state: Rc<RefCell<RuntimeState>>, wheel: TimerWheel; Default impl. poll added in step 6 */ }
 
 impl Runtime {
     pub fn new() -> Self;                                              // plain Self until step 7 (mio::Poll::new() adds io::Result)
@@ -232,14 +260,14 @@ impl Runtime {
 }
 
 // Free functions, tokio-style, backed by the thread-local installed by run():
-pub fn spawn<F>(future: F) where F: Future<Output = ()> + 'static;
-pub fn sleep(duration: Duration) -> Sleep;    // .await it inside any spawned task
-pub fn yield_now() -> YieldNow;               // Pending once, wake-self, then Ready
+pub fn spawn<F>(future: F) where F: Future<Output = ()> + 'static;    // NOT YET IMPLEMENTED
+pub fn sleep(duration: Duration) -> Sleep;    // .await it inside any spawned task   ✓ done
+pub fn yield_now() -> YieldNow;               // Pending once, wake-self, then Ready  ✓ done
 pub fn spawn_blocking<F, R>(f: F) -> BlockingTask<R>   // Phase 3
 where F: FnOnce() -> R + Send + 'static, R: Send + 'static;
 ```
 
-**Thread-local handle (locked in):** `run()` installs the runtime's `Rc<RefCell<TimerWheel>>` + task id allocator into a `thread_local!`, so `sleep()`, `spawn()`, *and* `spawn_blocking()` (Phase 3: + the pool's job sender) are all free functions with no parameters. This is literally what tokio's `SetCurrent` does — a nice "aha" for the reader. A task that wants to spawn more work calls the free `spawn()`; a task that wants to wait calls free `sleep()`; a task that wants to offload a blocking call calls free `spawn_blocking()`.
+**Thread-local handle (locked in):** `run()` installs the runtime's `Rc<RefCell<TimerWheel>>` + the current task id into a `thread_local!`, so `sleep()` (and later `spawn()`, `spawn_blocking()`) are free functions with no parameters. This is literally what tokio's `SetCurrent` does — a nice "aha" for the reader. A task that wants to wait calls free `sleep()`; later steps add free `spawn()` (enqueues an id into the shared state via the thread-local, no channel needed) and free `spawn_blocking()`.
 
 > `spawn` from *within* a task: works for free — it just enqueues an id into the shared state via the thread-local, and the drain loop picks it up next iteration. No channel needed. (One guard: the drain loop must not decide "no more work" based on the task map while it's mid-drain.)
 
@@ -394,27 +422,27 @@ fn main() -> io::Result<()> {
 
 Each step is: **write the failing test → make it pass → refactor.** Tests live in `#[cfg(test)]` modules *next to* the code, and integration tests that exercise the whole `run()` loop live in `tests/`.
 
-- [x] **Step 1** — Define the `Task` struct (`id` + `future`). *Test:* unit test for `next_id` monotonicity once spawn exists; nothing else to test yet — this step is mostly scaffolding.
-- [x] **Step 2** — Build the shared state: `Rc<RefCell<RuntimeState>>` with queue, task map, and id counter. *Test:* push/pop the queue, insert/remove a task from the map, ids never repeat. `RuntimeState` derives `Default`.
-- [x] **Step 3** — Implement the manual `RawWakerVTable` + `create_waker(shared, id)`. *Test (the one that teaches the most):* create a waker, clone it a few times, assert the shared `Rc` refcount goes up, `waker.wake()` enqueues the right id, and dropping everything brings refcount back to 1.
-- [x] **Step 4** — Write the Executor core (spawn + `run()`), **poll-only** — drain loop + block-on-empty, no timers, no reactor yet. *Tests (5 total):* empty initial state; spawn id/registration; immediate return with no work; shared-counter run (3 tasks, 3 polls); `Probe` future self-waking re-poll tests the full wake→repoll cycle. `Runtime` derives `Default`. Parks with a fixed 100ms `PARK_TIMEOUT`; refactored to the wheel in step 6.
-- [x] **Step 5** — Add the Timer Wheel + `sleep()` future + the `yield_now()` primitive. *Tests (5 total, in `timer_wheel.rs`):* wheel min-heap ordering; `sleep(0)` completes in runtime; two concurrent 100ms sleeps finish <200ms (parallel, not serial); `yield_now()` self-wakes then completes; dropped `Sleep` removes its entry from the wheel (the `Drop` test). All 17 tests pass, 0 clippy warnings.
-- [ ] **Step 6** — Bring in `mio::Poll` as the park primitive (currently `thread::sleep(timeout)` — works correctly for Phase 1 with zero registered sources). The wheel is *already wired* into the executor: `runtime.wheel`, `install`/`set_current_id`/`clear_current_id`, park timeout from `next_deadline`, expire/termination gates. When mio lands, `thread::sleep` → `mio::Poll::poll`. *Test:* the **concurrency demo** — concurrent sleeps + a `yield_now()` counter task, asserting `elapsed >= max_duration`, `elapsed < max_duration * 2`, and the exact counter value (this is the milestone test).
-- [ ] **Step 7** — Finalize `Runtime::new()` → `io::Result<Self>` (when `mio::Poll::new()` is added), `run()` already returns `io::Result<()>`, and audit that no non-test code `unwrap`s. Currently `new()` returns plain `Self` since no fallible ops exist yet.
+- **Step 1** — Define the `Task` struct (`id` + `future`). *Test:* unit test for `next_id` monotonicity once spawn exists; nothing else to test yet — this step is mostly scaffolding.
+- **Step 2** — Build the shared state: `Rc<RefCell<RuntimeState>>` with queue, task map, and id counter. *Test:* push/pop the queue, insert/remove a task from the map, ids never repeat. `RuntimeState` derives `Default`.
+- **Step 3** — Implement the manual `RawWakerVTable` + `create_waker(state, id)`. *Test (the one that teaches the most):* create a waker, clone it a few times, assert the shared `Rc` refcount goes up, `waker.wake()` enqueues the right id, and dropping everything brings refcount back to 1.
+- **Step 4** — Write the Executor core (spawn + `run()`), **poll-only** — drain loop + block-on-empty, no timers, no reactor yet. *Tests (5 total):* empty initial state; spawn id/registration; immediate return with no work; shared-counter run (3 tasks, 3 polls); `Probe` future self-waking re-poll tests the full wake→repoll cycle. `Runtime` derives `Default`. Parks with a fixed 100ms `PARK_TIMEOUT`; the wheel-driven park timeout was wired in with step 5.
+- **Step 5** — Add the Timer Wheel + `sleep()` future + the `yield_now()` primitive. *Tests (5 total, in `timer_wheel.rs`):* wheel min-heap ordering; `sleep(0)` completes in runtime; two concurrent 100ms sleeps finish <125ms (parallel, not serial); `yield_now()` self-wakes then completes; dropped `Sleep` removes its entry from the wheel (the `Drop` test). All 17 tests pass, 0 clippy warnings.
+- **Step 6** — Bring in `mio::Poll` as the park primitive (currently `thread::sleep(timeout)` — works correctly for Phase 1 with zero registered sources). The wheel is *already wired* into the executor: `runtime.wheel`, `install`/`set_current_id`/`clear_current_id`, park timeout from `next_deadline`, expire/termination gates. When mio lands, `thread::sleep` → `mio::Poll::poll`. *Test:* the **concurrency demo** — concurrent sleeps + a `yield_now()` counter task, asserting `elapsed >= max_duration`, `elapsed < max_duration * 2`, and the exact counter value (this is the milestone test).
+- **Step 7** — Finalize `Runtime::new()` → `io::Result<Self>` (when `mio::Poll::new()` is added), `run()` already returns `io::Result<()>`, and audit that no non-test code `unwrap`s. Currently `new()` returns plain `Self` since no fallible ops exist yet.
 
 ## Build Order — Phase 2 (deferred follow-up)
 
-- [ ] **Step 8** — Reactor dispatch: register a `mio::net::UnixStream::pair()` as a test source, drive events through the token→waker registry, assert a write on one end wakes the task polling the other. (Real fds, no network, no server.)
-- [ ] **Step 9** — `AsyncTcpStream` wrapper: `WouldBlock` → `register` + store waker + `Pending`; readable/writable → `Ready`. *Tests:* round-trip a byte string through `UnixStream::pair()`, end-to-end through the runtime.
-- [ ] **Step 10** — `HttpGetFuture`: raw HTTP/1.1 GET over `AsyncTcpStream` — connects, sends the request, registers read interest, accumulates the response, returns the body on EOF. *Tests:* fetch from a real HTTP server (e.g. local `python3 -m http.server` or `httpbin.org`).
-- [ ] **Step 11** — Echo demo: concurrent reader task + writer task over the socket pair.
+- **Step 8** — Reactor dispatch: register a `mio::net::UnixStream::pair()` as a test source, drive events through the token→waker registry, assert a write on one end wakes the task polling the other. (Real fds, no network, no server.)
+- **Step 9** — `AsyncTcpStream` wrapper: `WouldBlock` → `register` + store waker + `Pending`; readable/writable → `Ready`. *Tests:* round-trip a byte string through `UnixStream::pair()`, end-to-end through the runtime.
+- **Step 10** — `HttpGetFuture`: raw HTTP/1.1 GET over `AsyncTcpStream` — connects, sends the request, registers read interest, accumulates the response, returns the body on EOF. *Tests:* fetch from a real HTTP server (e.g. local `python3 -m http.server` or `httpbin.org`).
+- **Step 11** — Echo demo: concurrent reader task + writer task over the socket pair.
 
 ## Build Order — Phase 3 (`spawn_blocking` + workers, deferred)
 
-- [ ] **Step 12** — Build `WorkerPool` in isolation (pure `std`, no runtime): a job channel + N worker threads, each `recv` → run → drop. *Tests:* a worker runs a closure and the result is observable; workers exit when the channel closes (no thread leaks).
-- [ ] **Step 13** — Add `BlockingTask` + the `WAKEN` wake path. *Tests:* the milestone — `spawn_blocking(read big file)` interleaves with a `sleep(50ms)` task; round-trip value correctness; two concurrent `spawn_blocking`s both complete; a cancelled `BlockingTask` leaves `RuntimeState::blocking` empty (the Phase 3 `Drop` test).
-- [ ] **Step 14** — Worker panic semantics: `catch_unwind` in the worker, ship the payload through the result channel, `resume_unwind` on the task's next poll. *Test:* a panicking closure makes `run()` panic — never hang.
-- [ ] **Step 15** — Finalize shutdown: close the job channel and join the workers on `Runtime` drop. *Test:* after `run()`, every worker thread has exited.
+- **Step 12** — Build `WorkerPool` in isolation (pure `std`, no runtime): a job channel + N worker threads, each `recv` → run → drop. *Tests:* a worker runs a closure and the result is observable; workers exit when the channel closes (no thread leaks).
+- **Step 13** — Add `BlockingTask` + the `WAKEN` wake path. *Tests:* the milestone — `spawn_blocking(read big file)` interleaves with a `sleep(50ms)` task; round-trip value correctness; two concurrent `spawn_blocking`s both complete; a cancelled `BlockingTask` leaves `RuntimeState::blocking` empty (the Phase 3 `Drop` test).
+- **Step 14** — Worker panic semantics: `catch_unwind` in the worker, ship the payload through the result channel, `resume_unwind` on the task's next poll. *Test:* a panicking closure makes `run()` panic — never hang.
+- **Step 15** — Finalize shutdown: close the job channel and join the workers on `Runtime` drop. *Test:* after `run()`, every worker thread has exited.
 
 ---
 
