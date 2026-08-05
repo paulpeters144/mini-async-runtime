@@ -1,4 +1,4 @@
-Building a minimal, single-threaded async runtime using only `mio` and `std` is one of the best ways to understand how async Rust works under the hood. Without macros or high-level runtime crates (like `tokio` or `futures`), you interact directly with the standard library primitives (`std::future::Future`, `std::task::Waker`, `std::task::RawWaker`, `std::pin::Pin`) and `mio`'s OS polling primitives (`Poll`, `Events`, `Registry`, `Token`).
+					Building a minimal, single-threaded async runtime using only `mio` and `std` is one of the best ways to understand how async Rust works under the hood. Without macros or high-level runtime crates (like `tokio` or `futures`), you interact directly with the standard library primitives (`std::future::Future`, `std::task::Waker`, `std::task::RawWaker`, `std::pin::Pin`) and `mio`'s OS polling primitives (`Poll`, `Events`, `Registry`, `Token`).
 
 To get a simple, single-threaded runtime working, you need **6 core components** (the async I/O wrapper you build on top is the 7th).
 
@@ -14,10 +14,10 @@ To get a simple, single-threaded runtime working, you need **6 core components**
 - [x] **Step 6** — `mio::Poll` as the park primitive (`thread::sleep` → `self.poll.poll`; milestone test in `tests/core.rs`)
 - [x] **Step 7** — `Runtime::new()` → `io::Result<Runtime>` + no-unwrap audit (deferred by decision: `new()` keeps returning plain `Self`)
 
-**Phase 2 — reactor + networking (deferred):**
+**Phase 2 — reactor + I/O wrappers (in progress):**
 
-- [ ] **Step 8** — Reactor dispatch
-- [ ] **Step 9** — `AsyncTcpStream`
+- [x] **Step 8** — Reactor dispatch (token→waker registry, `park`, `dispatch`)
+- [x] **Step 9** — Generic `Readable<T>` / `Writable<T>` I/O futures (`src/io.rs`); supersedes the original `AsyncTcpStream` plan — works with any `mio::event::Source`
 - [ ] **Step 10** — `HttpGetFuture`
 - [ ] **Step 11** — Echo demo
 
@@ -40,7 +40,7 @@ To get a simple, single-threaded runtime working, you need **6 core components**
     - total wall-clock time ≈ the *max* sleep duration (proves the executor parks instead of busy-looping or serializing);
     - the counter hit its expected value (proves tasks interleave and re-poll correctly, deterministically via yields);
     - `run()` returns cleanly with no tasks left in the queue, task map, or timer wheel.
-- **Phase 2 (follow-up plan, deferred):** Reactor I/O dispatch + `AsyncTcpStream` + an echo demo over `UnixStream::pair()`. The sections below on I/O registration and the reactor registry are written for Phase 2; Phase 1 uses `mio::Poll` only as the park-with-timeout primitive, with zero registered sources.
+- **Phase 2 (partially done):** Reactor I/O dispatch + generic `Readable<T>`/`Writable<T>` futures (replaces the original `AsyncTcpStream` plan). Steps 8–9 complete; `HttpGetFuture` and echo demo still deferred.
 - **Phase 3 (follow-up plan, deferred):** `spawn_blocking` + a worker pool — the escape hatch that makes **file reads** (and any blocking call) non-blocking by running them on worker threads (section 7).
 - **Deliberately excluded:** a multi-threaded *executor* (Phase 3 adds worker threads for blocking offload only — workers never poll futures), `JoinHandle`s returning values, macro wrappers like `#[runtime::main]`/`block_on` sugar beyond `run()`.
 
@@ -73,9 +73,9 @@ src/
   waker.rs      # ✓ done — RawWakerVTable boilerplate, create_waker(), WakerData
   executor.rs   # ✓ done — Runtime { state, wheel, poll, events } with spawn() + run() + 5 tests, derives Default, mio park wired
   timer_wheel.rs # ✓ done — TimerWheel, Sleep, YieldNow, free functions, thread-local helpers + 5 tests
-  reactor.rs    # — Phase 2: registry map + dispatch (parking Poll + WAKEN token live here)
-  tcp.rs        # — Phase 2: AsyncTcpStream wrapper over mio::net::TcpStream
-  http.rs       # — Phase 2: HttpGetFuture (raw HTTP/1.1 GET over AsyncTcpStream)
+  reactor.rs    # ✓ done — Reactor { poll, registry, next_token } + allocate_token(), dispatch(), register/deregister_source, thread-local with()
+  io.rs         # ✓ done — Readable<T>, Writable<T>, read(), write(), Future/Drop impls + 6 tests
+  http.rs       # — Phase 2: HttpGetFuture (raw HTTP/1.1 GET over io::read/io::write)
   blocking.rs   # — Phase 3: WorkerPool, BlockingTask, spawn_blocking()
 tests/
   core.rs       # ✓ done — step 6's concurrency demo (the milestone test) lives here
@@ -107,7 +107,7 @@ Every trace line carries the task id; grepping one id across the log tells the w
 - **No `unwrap()`/`expect()` in non-test code.** Every fallible operation returns `io::Result<T>` and propagates with `?`.
 - **One deliberate exception (locked in):** `Runtime::new()` returns plain `Self`, `.unwrap()`-ing `mio::Poll::new()`. Kept so the constructor stays `Default`-able; Step 7 is the `io::Result<Runtime>` + no-unwrap audit, deferred.
 - `run(&mut self)` → `io::Result<()>` (propagates `Poll::poll` errors).
-- Phase-2 `AsyncTcpStream` methods (`register`/`read`/`write`/`deregister`) → `io::Result`.
+- Phase-2 I/O future methods (`register`/`read`/`write`/`deregister`) → `io::Result`.
 - Infallible-by-construction operations (Rc allocations, `HashMap` inserts, wheel pops) stay plain — no invented `Result` types.
 - The **only** remaining panics are invariant violations, and they must be *loud*:
   - A `RefCell` double-borrow (borrow conflict in the waker path) → panic. That's a bug in our wake discipline, and it's the exact bug we want a red test to catch.
@@ -207,15 +207,15 @@ All three live behind a single `Rc<RefCell<RuntimeState>>` handed to spawners, w
 
 The **Reactor** monitors file descriptors (sockets, pipes, timers) using the OS's native multiplexing (`epoll` on Linux, `kqueue` on macOS, `IOCP` on Windows) via `mio`.
 
-> **Phase 1 vs Phase 2:** In Phase 1 the reactor is just `mio::Poll` used as a *parking device* — `poll(&mut events, timeout)` with zero registered sources. The `HashMap<Token, Waker>` registry, the `register` flow, and event dispatch below are all Phase 2 (deferred). Build the parking part now; the registry is additive later.
+> **Phase 1 vs Phase 2:** In Phase 1 the reactor is just `mio::Poll` used as a *parking device* — `poll(&mut events, timeout)` with zero registered sources. Phase 2 added the `HashMap<Token, Waker>` registry, the `register`/`deregister` flows, event `dispatch`, a token allocator (`allocate_token()`), and the generic `Readable<T>` / `Writable<T>` I/O futures in `src/io.rs`.
 
 **Registry Mapping:** The Reactor maintains a `HashMap<mio::Token, Waker>` (or array) mapping OS event tokens to task `Waker`s.
 
 **How non-blocking I/O interacts with it:**
 
-1. An async I/O wrapper (e.g., custom `AsyncTcpStream` wrapping `mio::net::TcpStream`) attempts to `read()`.
-2. If the OS returns `ErrorKind::WouldBlock`, the socket calls `mio::Registry::register()` with its file descriptor, a `mio::Token(task_id)`, and requested `Interest` (Readable/Writable).
-3. It saves the task's `cx.waker()` into the Reactor's map and returns `Poll::Pending`.
+1. An async I/O wrapper (`Readable<T>` or `Writable<T>` in `src/io.rs`) attempts to `read()`/`write()`.
+2. If the OS returns `ErrorKind::WouldBlock` (or a partial write), the future calls `reactor::register_source()` with the source, a `mio::Token` allocated by `Reactor::allocate_token()`, and requested `Interest` (Readable/Writable).
+3. It saves the task's `cx.waker()` into the Reactor's registry and returns `Poll::Pending`.
 
 **`mio::Waker`:** `mio::Waker` is a separate, thread-safe wake-up mechanism for the reactor (for cross-thread wakes / shutdown). Phases 1 & 2 never need it — every wake is same-thread. **Phase 3 builds it:** it is the one `Send` + `Clone` object a worker thread holds, and `wake()` makes a blocked `Poll::poll` return immediately with a reserved `WAKEN` token (section 7). It also remains handy for a clean `Runtime::shutdown()` signal.
 
@@ -263,6 +263,8 @@ impl Runtime {
 pub fn spawn<F>(future: F) where F: Future<Output = ()> + 'static;    // NOT YET IMPLEMENTED
 pub fn sleep(duration: Duration) -> Sleep;    // .await it inside any spawned task   ✓ done
 pub fn yield_now() -> YieldNow;               // Pending once, wake-self, then Ready  ✓ done
+pub fn read<T: mio::event::Source>(src: T) -> Readable<T>;           // ✓ done
+pub fn write<T: mio::event::Source>(src: T, buf: Vec<u8>) -> Writable<T>; // ✓ done
 pub fn spawn_blocking<F, R>(f: F) -> BlockingTask<R>   // Phase 3
 where F: FnOnce() -> R + Send + 'static, R: Send + 'static;
 ```
@@ -430,11 +432,11 @@ Each step is: **write the failing test → make it pass → refactor.** Tests li
 - **Step 6** — Bring in `mio::Poll` as the park primitive (**done**: `thread::sleep(timeout)` → `self.poll.poll(&mut self.events, timeout)?`; zero registered sources in Phase 1). The wheel was *already wired* into the executor: `runtime.wheel`, `install`/`set_current_id`/`clear_current_id`, park timeout from `next_deadline`, expire/termination gates. *Test:* the **concurrency demo** — concurrent sleeps + a `yield_now()` counter task, asserting `elapsed >= max_duration`, `elapsed < max_duration * 2`, and the exact counter value (this is the milestone test) in `tests/core.rs`.
 - **Step 7** — Finalize `Runtime::new()` → `io::Result<Self>` + audit that no non-test code `unwrap`s. **Deferred by decision:** `mio::Poll::new()` is already integrated, but `new()` still returns plain `Self` (`.unwrap()` on `Poll::new()`) to keep `Default` derivable. Revisit here.
 
-## Build Order — Phase 2 (deferred follow-up)
+## Build Order — Phase 2 (in progress)
 
-- **Step 8** — Reactor dispatch: register a `mio::net::UnixStream::pair()` as a test source, drive events through the token→waker registry, assert a write on one end wakes the task polling the other. (Real fds, no network, no server.)
-- **Step 9** — `AsyncTcpStream` wrapper: `WouldBlock` → `register` + store waker + `Pending`; readable/writable → `Ready`. *Tests:* round-trip a byte string through `UnixStream::pair()`, end-to-end through the runtime.
-- **Step 10** — `HttpGetFuture`: raw HTTP/1.1 GET over `AsyncTcpStream` — connects, sends the request, registers read interest, accumulates the response, returns the body on EOF. *Tests:* fetch from a real HTTP server (e.g. local `python3 -m http.server` or `httpbin.org`).
+- **Step 8** — Reactor dispatch: register a `mio::net::UnixStream::pair()` as a test source, drive events through the token→waker registry, assert a write on one end wakes the task polling the other. (Real fds, no network, no server.) **done** — `reactor.rs` has `Reactor`, `allocate_token()`, `register()`/`deregister()`, `register_source()`/`deregister_source()`, `dispatch()`, and 6 unit tests.
+- **Step 9** — Generic I/O wrappers: `Readable<T>` / `Writable<T>` futures in `src/io.rs`. Any `mio::event::Source + Read`/`Write` — not TCP-specific. `WouldBlock` → register + store waker + `Pending`; data ready → deregister + `Ready`. `Drop` deregisters on cancellation (mirrors `Sleep`). Supersedes the original `AsyncTcpStream` plan. *Tests:* 6 tests covering read/write round-trip, coexisting pairs, the full reader+writer pipe, and partial-write waker storage. **done**
+- **Step 10** — `HttpGetFuture`: raw HTTP/1.1 GET over `io::read()`/`io::write()` — connects, sends the request, registers read interest, accumulates the response, returns the body on EOF. *Tests:* fetch from a real HTTP server (e.g. local `python3 -m http.server` or `httpbin.org`).
 - **Step 11** — Echo demo: concurrent reader task + writer task over the socket pair.
 
 ## Build Order — Phase 3 (`spawn_blocking` + workers, deferred)

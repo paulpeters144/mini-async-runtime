@@ -10,13 +10,28 @@ pub(crate) type ReactorHandle = Rc<RefCell<Reactor>>;
 pub struct Reactor {
     poll: mio::Poll,
     registry: HashMap<mio::Token, Waker>,
+    next_token: usize,
 }
 
 impl Reactor {
     pub fn new() -> Self {
         let poll = mio::Poll::new().unwrap();
         let registry = HashMap::new();
-        Reactor { poll, registry }
+        Reactor {
+            poll,
+            registry,
+            next_token: 0,
+        }
+    }
+
+    /// Hand out a unique token for an I/O future to register its source under.
+    ///
+    /// I/O futures call this (via `with`) when they are constructed so that
+    /// each registered source gets its own distinct token on the shared poller.
+    pub fn allocate_token(&mut self) -> mio::Token {
+        let token = mio::Token(self.next_token);
+        self.next_token += 1;
+        token
     }
 
     pub fn registry(&self) -> &mio::Registry {
@@ -81,10 +96,8 @@ pub(crate) fn install(handle: ReactorHandle) {
 
 // Free-function access to the reactor installed by `install()`: a future that
 // does not want to carry its own `ReactorHandle` reaches the shared reactor
-// through this. The I/O wrapper future (the analogue of `Sleep`'s free
-// `sleep()`) will be its first non-test consumer; today only tests use it,
-// hence the dead-code allowance in non-test builds.
-#[cfg_attr(not(test), allow(dead_code))]
+// through this. The I/O wrapper futures (`io::read` / `io::write`, the
+// analogue of `Sleep`'s free `sleep()`) are its consumers.
 pub(crate) fn with<R>(f: impl FnOnce(&mut Reactor) -> R) -> R {
     HANDLE.with(|h| {
         f(&mut h
@@ -115,6 +128,17 @@ mod tests {
     use mio::{Interest, Token};
     use std::io::Write;
     use std::time::Instant;
+
+    // Tokens must be unique per registered source, or two I/O futures would
+    // collide on the same readiness event and wake the wrong task. `allocate`
+    // returns a fresh, never-reused token each call.
+    #[test]
+    fn allocate_token_gives_distinct_tokens() {
+        let mut reactor = Reactor::new();
+        let first = reactor.allocate_token();
+        let second = reactor.allocate_token();
+        assert_ne!(first, second);
+    }
 
     // The registry is the heart of the reactor: a map from `mio::Token` (an OS
     // readiness token) back to the `Waker` of the task parked on that source.

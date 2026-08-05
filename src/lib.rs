@@ -1,4 +1,5 @@
 pub mod executor;
+pub mod io;
 pub mod reactor;
 pub mod runtime_state;
 pub mod task;

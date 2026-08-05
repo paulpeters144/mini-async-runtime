@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 pub struct Runtime {
     state: Rc<RefCell<RuntimeState>>,
     wheel: TimerWheel,
-    reactor: ReactorHandle,
+    pub(crate) reactor: ReactorHandle,
     events: mio::Events,
 }
 
@@ -113,13 +113,11 @@ impl Default for Runtime {
 #[cfg(test)]
 use std::cell::Cell;
 #[cfg(test)]
-use std::io::{Read, Write};
+use std::io::Write;
 #[cfg(test)]
 use std::pin::Pin;
 #[cfg(test)]
 use std::thread;
-#[cfg(test)]
-use mio::{Interest, Token};
 
 // The runtime is the thing that makes futures progress. `new()` is just
 // allocation: an empty `RuntimeState` with an empty queue and no task map. A
@@ -233,61 +231,22 @@ fn probe_future_re_polls_until_ready() {
     assert!(state.tasks.is_empty());
 }
 
-// A task parked on a socket: the I/O analogue of `Sleep`. On its first
-// `WouldBlock` poll it reaches the shared reactor through the thread-local
-// `reactor::with` accessor, registering the read end with the poller and
-// storing its waker under the token; returning `Pending` makes the executor
-// park the thread. A write on the other end of the socket pair — from another
-// thread — fires the readiness event; `dispatch` calls the stored waker, which
-// re-queues the task; the next poll finds the bytes, deregisters, and
-// completes. The task is then dropped, the reactor empties, and `run()` can
-// return. The whole reactor in one `run()` call.
-#[cfg(test)]
-struct Readable {
-    rx: mio::net::UnixStream,
-    token: mio::Token,
-    registered: bool,
-}
-
-#[cfg(test)]
-impl Future for Readable {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-        let mut buf = [0u8; 16];
-        match this.rx.read(&mut buf) {
-            Ok(_) => {
-                reactor::with(|reactor| {
-                    let _ = reactor.deregister_source(&mut this.rx, this.token);
-                });
-                Poll::Ready(())
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if !this.registered {
-                    reactor::with(|reactor| {
-                        reactor
-                            .register_source(&mut this.rx, this.token, Interest::READABLE)
-                            .unwrap();
-                    });
-                    this.registered = true;
-                }
-                reactor::with(|reactor| reactor.register(this.token, cx.waker().clone()));
-                Poll::Pending
-            }
-            Err(e) => panic!("read failed: {e}"),
-        }
-    }
-}
-
+// A task parked on a socket: the I/O analogue of `Sleep`, now provided by the
+// public `io::read` future. On its first `WouldBlock` poll it reaches the
+// shared reactor through the thread-local `reactor::with` accessor, registering
+// the read end with the poller and storing its waker under a token allocated by
+// the reactor; returning `Pending` makes the executor park the thread. A write
+// on the other end of the socket pair — from another thread — fires the
+// readiness event; `dispatch` calls the stored waker, which re-queues the task;
+// the next poll finds the bytes, deregisters, and completes. The task is then
+// dropped, the reactor empties, and `run()` can return. The whole reactor in
+// one `run()` call.
 #[test]
 fn run_wakes_a_task_parked_on_io_readiness() {
     let (tx, rx) = mio::net::UnixStream::pair().unwrap();
     let mut runtime = Runtime::new();
-    runtime.spawn(Readable {
-        rx,
-        token: Token(7),
-        registered: false,
+    runtime.spawn(async move {
+        let _ = crate::io::read(rx).await;
     });
 
     thread::spawn(move || {
@@ -301,5 +260,33 @@ fn run_wakes_a_task_parked_on_io_readiness() {
     let state = runtime.state.borrow();
     assert!(state.queue.is_empty());
     assert!(state.tasks.is_empty());
+    assert!(runtime.reactor.borrow().is_empty());
+}
+
+// The whole runtime in one `run()`: two tasks over a single socket pair. The
+// writer task flushes `io::write(tx, …)` while the reader task receives
+// `io::read(rx); …`; when the writer runs first the read might block and park
+// on the reactor, and the readiness event from the write wakes it. Either way
+// both tasks interleave on one thread, both complete, the reactor empties, and
+// `run()` returns.
+#[test]
+fn two_tasks_exchange_bytes_over_a_socket_pipe() {
+    let (tx, rx) = mio::net::UnixStream::pair().unwrap();
+    let mut runtime = Runtime::new();
+
+    runtime.spawn(async move {
+        crate::io::write(tx, b"ping".to_vec()).await;
+    });
+
+    let got = Rc::new(RefCell::new(Vec::new()));
+    let got_writer = got.clone();
+    runtime.spawn(async move {
+        let bytes = crate::io::read(rx).await;
+        *got_writer.borrow_mut() = bytes;
+    });
+
+    runtime.run().expect("run should not fail");
+
+    assert_eq!(got.borrow().as_slice(), b"ping");
     assert!(runtime.reactor.borrow().is_empty());
 }
