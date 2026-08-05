@@ -11,8 +11,8 @@ To get a simple, single-threaded runtime working, you need **6 core components**
 - [x] **Step 3** — Manual `RawWakerVTable` + `create_waker`
 - [x] **Step 4** — Executor core: `spawn()` + `run()` drain loop
 - [x] **Step 5** — Timer wheel + `sleep()` + `yield_now()` (17 tests green, 0 clippy warnings)
-- [ ] **Step 6** — `mio::Poll` as the park primitive (today: `thread::sleep(timeout)`)
-- [ ] **Step 7** — `Runtime::new()` → `io::Result<Runtime>` + no-unwrap audit
+- [x] **Step 6** — `mio::Poll` as the park primitive (`thread::sleep` → `self.poll.poll`; milestone test in `tests/core.rs`)
+- [ ] **Step 7** — `Runtime::new()` → `io::Result<Runtime>` + no-unwrap audit (deferred by decision: `new()` keeps returning plain `Self`)
 
 **Phase 2 — reactor + networking (deferred):**
 
@@ -71,14 +71,14 @@ src/
   runtime_state.rs # ✓ done — RuntimeState { queue, tasks, next_id } (blocking added in Phase 3)
   task.rs       # ✓ done — Task { id, future }
   waker.rs      # ✓ done — RawWakerVTable boilerplate, create_waker(), WakerData
-  executor.rs   # ✓ done — Runtime { state, wheel } with spawn() + run() + 5 tests, derives Default, wheel fully wired
+  executor.rs   # ✓ done — Runtime { state, wheel, poll, events } with spawn() + run() + 5 tests, derives Default, mio park wired
   timer_wheel.rs # ✓ done — TimerWheel, Sleep, YieldNow, free functions, thread-local helpers + 5 tests
   reactor.rs    # — Phase 2: registry map + dispatch (parking Poll + WAKEN token live here)
   tcp.rs        # — Phase 2: AsyncTcpStream wrapper over mio::net::TcpStream
   http.rs       # — Phase 2: HttpGetFuture (raw HTTP/1.1 GET over AsyncTcpStream)
   blocking.rs   # — Phase 3: WorkerPool, BlockingTask, spawn_blocking()
 tests/
-  core.rs       # — NOT YET CREATED: step 6's concurrency demo (the milestone test) lives here
+  core.rs       # ✓ done — step 6's concurrency demo (the milestone test) lives here
   blocking.rs   # — Phase 3: worker/interleave integration tests (file-read milestone)
 ```
 
@@ -105,7 +105,7 @@ Every trace line carries the task id; grepping one id across the log tells the w
 ## Error Handling Policy
 
 - **No `unwrap()`/`expect()` in non-test code.** Every fallible operation returns `io::Result<T>` and propagates with `?`.
-- `Runtime::new()` currently returns plain `Self` (no fallible operations yet). Step 7 changes this to `io::Result<Runtime>` when `mio::Poll::new()` is integrated.
+- **One deliberate exception (locked in):** `Runtime::new()` returns plain `Self`, `.unwrap()`-ing `mio::Poll::new()`. Kept so the constructor stays `Default`-able; Step 7 is the `io::Result<Runtime>` + no-unwrap audit, deferred.
 - `run(&mut self)` → `io::Result<()>` (propagates `Poll::poll` errors).
 - Phase-2 `AsyncTcpStream` methods (`register`/`read`/`write`/`deregister`) → `io::Result`.
 - Infallible-by-construction operations (Rc allocations, `HashMap` inserts, wheel pops) stay plain — no invented `Result` types.
@@ -251,10 +251,10 @@ The **deadline is the contract between the timer future and the executor:**
 Everything `tests/` (and the demo `main`) uses is exactly this:
 
 ```rust
-pub struct Runtime { /* state: Rc<RefCell<RuntimeState>>, wheel: TimerWheel; Default impl. poll added in step 6 */ }
+pub struct Runtime { /* state: Rc<RefCell<RuntimeState>>, wheel: TimerWheel, poll: mio::Poll, events: mio::Events; Default impl */ }
 
 impl Runtime {
-    pub fn new() -> Self;                                              // plain Self until step 7 (mio::Poll::new() adds io::Result)
+    pub fn new() -> Self;                                              // plain Self by decision; step 7 may revisit io::Result
     pub fn spawn<F>(&mut self, future: F) where F: Future<Output = ()> + 'static;
     pub fn run(&mut self) -> io::Result<()>;                           // blocks until done
 }
@@ -427,8 +427,8 @@ Each step is: **write the failing test → make it pass → refactor.** Tests li
 - **Step 3** — Implement the manual `RawWakerVTable` + `create_waker(state, id)`. *Test (the one that teaches the most):* create a waker, clone it a few times, assert the shared `Rc` refcount goes up, `waker.wake()` enqueues the right id, and dropping everything brings refcount back to 1.
 - **Step 4** — Write the Executor core (spawn + `run()`), **poll-only** — drain loop + block-on-empty, no timers, no reactor yet. *Tests (5 total):* empty initial state; spawn id/registration; immediate return with no work; shared-counter run (3 tasks, 3 polls); `Probe` future self-waking re-poll tests the full wake→repoll cycle. `Runtime` derives `Default`. Parks with a fixed 100ms `PARK_TIMEOUT`; the wheel-driven park timeout was wired in with step 5.
 - **Step 5** — Add the Timer Wheel + `sleep()` future + the `yield_now()` primitive. *Tests (5 total, in `timer_wheel.rs`):* wheel min-heap ordering; `sleep(0)` completes in runtime; two concurrent 100ms sleeps finish <125ms (parallel, not serial); `yield_now()` self-wakes then completes; dropped `Sleep` removes its entry from the wheel (the `Drop` test). All 17 tests pass, 0 clippy warnings.
-- **Step 6** — Bring in `mio::Poll` as the park primitive (currently `thread::sleep(timeout)` — works correctly for Phase 1 with zero registered sources). The wheel is *already wired* into the executor: `runtime.wheel`, `install`/`set_current_id`/`clear_current_id`, park timeout from `next_deadline`, expire/termination gates. When mio lands, `thread::sleep` → `mio::Poll::poll`. *Test:* the **concurrency demo** — concurrent sleeps + a `yield_now()` counter task, asserting `elapsed >= max_duration`, `elapsed < max_duration * 2`, and the exact counter value (this is the milestone test).
-- **Step 7** — Finalize `Runtime::new()` → `io::Result<Self>` (when `mio::Poll::new()` is added), `run()` already returns `io::Result<()>`, and audit that no non-test code `unwrap`s. Currently `new()` returns plain `Self` since no fallible ops exist yet.
+- **Step 6** — Bring in `mio::Poll` as the park primitive (**done**: `thread::sleep(timeout)` → `self.poll.poll(&mut self.events, timeout)?`; zero registered sources in Phase 1). The wheel was *already wired* into the executor: `runtime.wheel`, `install`/`set_current_id`/`clear_current_id`, park timeout from `next_deadline`, expire/termination gates. *Test:* the **concurrency demo** — concurrent sleeps + a `yield_now()` counter task, asserting `elapsed >= max_duration`, `elapsed < max_duration * 2`, and the exact counter value (this is the milestone test) in `tests/core.rs`.
+- **Step 7** — Finalize `Runtime::new()` → `io::Result<Self>` + audit that no non-test code `unwrap`s. **Deferred by decision:** `mio::Poll::new()` is already integrated, but `new()` still returns plain `Self` (`.unwrap()` on `Poll::new()`) to keep `Default` derivable. Revisit here.
 
 ## Build Order — Phase 2 (deferred follow-up)
 

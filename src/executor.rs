@@ -7,21 +7,27 @@ use std::future::Future;
 use std::io::{self};
 use std::rc::Rc;
 use std::task::{Context, Poll};
-use std::thread;
 use std::time::{Duration, Instant};
 
 pub struct Runtime {
     state: Rc<RefCell<RuntimeState>>,
     wheel: TimerWheel,
+    poll: mio::Poll,
+    events: mio::Events,
 }
-
-const PARK_TIMEOUT: Duration = Duration::from_millis(100);
 
 impl Runtime {
     pub fn new() -> Self {
         let state = RuntimeState::new();
         let wheel = Rc::new(RefCell::new(std::collections::BinaryHeap::new()));
-        Runtime { state, wheel }
+        let poll = mio::Poll::new().unwrap();
+        let events = mio::Events::with_capacity(64);
+        Runtime {
+            state,
+            wheel,
+            poll,
+            events,
+        }
     }
 
     pub fn spawn<F>(&mut self, future: F)
@@ -83,9 +89,8 @@ impl Runtime {
                     } else {
                         Duration::ZERO
                     }
-                })
-                .unwrap_or(PARK_TIMEOUT);
-            thread::sleep(timeout);
+                });
+            self.poll.poll(&mut self.events, timeout)?;
 
             for id in timer_wheel::expire_due(&self.wheel) {
                 self.state.borrow_mut().queue.push_back(id);
