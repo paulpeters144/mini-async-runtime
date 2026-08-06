@@ -133,11 +133,6 @@ pub struct BlockingTask<R> {
 
 #[cfg(test)]
 impl<R> BlockingTask<R> {
-    /// Test-only handles for the Phase 3 Drop test.
-    pub(crate) fn state(&self) -> std::rc::Rc<std::cell::RefCell<RuntimeState>> {
-        self.state.clone()
-    }
-
     pub(crate) fn id(&self) -> usize {
         self.id
     }

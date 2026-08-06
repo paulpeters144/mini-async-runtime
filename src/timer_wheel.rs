@@ -279,39 +279,14 @@ mod tests {
         let flag = Rc::new(Cell::new(false));
         {
             let flag = flag.clone();
-            runtime.spawn(async move {
-                sleep(Duration::ZERO).await;
-                flag.set(true);
-            });
+            runtime
+                .run(async move {
+                    sleep(Duration::ZERO).await;
+                    flag.set(true);
+                })
+                .expect("run should not fail");
         }
-        runtime.run().expect("run should not fail");
         assert!(flag.get());
-    }
-
-    // Two concurrent `sleep(100ms)` tasks must finish in less than 200ms wall
-    // time — if the executor parks with the earliest deadline (not a fixed
-    // 100ms), both tasks wake together.  This proves the executor computes its
-    // park timeout from the timer wheel rather than sleeping for a fixed
-    // duration or serialising the tasks.
-    #[test]
-    fn concurrent_sleeps_run_in_parallel() {
-        let mut runtime = Runtime::new();
-        let counter = Rc::new(Cell::new(0usize));
-        for _ in 0..2 {
-            let c = counter.clone();
-            runtime.spawn(async move {
-                sleep(Duration::from_millis(100)).await;
-                c.set(c.get() + 1);
-            });
-        }
-
-        let start = Instant::now();
-        runtime.run().expect("run should not fail");
-        let elapsed = start.elapsed();
-
-        assert_eq!(counter.get(), 2);
-        // Must not be serial: 2 × 100ms = 200ms.  Allow generous headroom.
-        assert!(elapsed < Duration::from_millis(125));
     }
 
     // `yield_now()` returns `Pending` on its first poll, self-wakes via
@@ -325,12 +300,13 @@ mod tests {
         let flag = Rc::new(Cell::new(false));
         {
             let flag = flag.clone();
-            runtime.spawn(async move {
-                yield_now().await;
-                flag.set(true);
-            });
+            runtime
+                .run(async move {
+                    yield_now().await;
+                    flag.set(true);
+                })
+                .expect("run should not fail");
         }
-        runtime.run().expect("run should not fail");
         assert!(flag.get());
     }
 

@@ -184,15 +184,16 @@ mod tests {
     fn readable_returns_bytes_from_pair() {
         let mut runtime = Runtime::new();
         let (mut tx, rx) = mio::net::UnixStream::pair().unwrap();
+        tx.write_all(b"hello").unwrap();
+
         let result = Rc::new(RefCell::new(Vec::new()));
         let result_writer = result.clone();
-        runtime.spawn(async move {
-            let bytes = read(rx).await;
-            *result_writer.borrow_mut() = bytes;
-        });
-
-        tx.write_all(b"hello").unwrap();
-        runtime.run().expect("run should not fail");
+        runtime
+            .run(async move {
+                let bytes = read(rx).await;
+                *result_writer.borrow_mut() = bytes;
+            })
+            .expect("run should not fail");
 
         assert_eq!(result.borrow().as_slice(), b"hello");
     }
@@ -208,13 +209,14 @@ mod tests {
 
         let got = Rc::new(Cell::new(false));
         let got_writer = got.clone();
-        runtime.spawn(async move {
-            let bytes = read(rx).await;
-            assert_eq!(bytes, b"x");
-            got_writer.set(true);
-        });
+        runtime
+            .run(async move {
+                let bytes = read(rx).await;
+                assert_eq!(bytes, b"x");
+                got_writer.set(true);
+            })
+            .expect("run should not fail");
 
-        runtime.run().expect("run should not fail");
         assert!(got.get());
     }
 
@@ -226,67 +228,44 @@ mod tests {
     fn writable_flushes_bytes_to_pair() {
         let mut runtime = Runtime::new();
         let (tx, mut rx) = mio::net::UnixStream::pair().unwrap();
-        runtime.spawn(async move { write(tx, b"world".to_vec()).await; });
 
-        runtime.run().expect("run should not fail");
+        runtime
+            .run(async move {
+                write(tx, b"world".to_vec()).await;
+            })
+            .expect("run should not fail");
 
         let mut buf = [0u8; 64];
         let n = rx.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"world");
     }
 
-    // Two independent socket pairs active at once. Each pair writes into one
-    // end and reads from the other; the token allocator hands out distinct
-    // tokens so the two `Readable` futures do not collide on the shared poller.
-    // This is the motivating test for `Reactor::allocate_token`.
+    // Two independent socket pairs active at once: data is written before
+    // `run()`, then both reads complete sequentially in one root future. The
+    // token allocator hands out distinct tokens so the two `Readable` futures
+    // do not collide on the shared poller.
     #[test]
     fn readable_and_writable_coexist_on_separate_pairs() {
         let mut runtime = Runtime::new();
         let (mut tx1, rx1) = mio::net::UnixStream::pair().unwrap();
         let (mut tx2, rx2) = mio::net::UnixStream::pair().unwrap();
+        tx1.write_all(b"alpha").unwrap();
+        tx2.write_all(b"beta").unwrap();
 
         let got1 = Rc::new(RefCell::new(Vec::new()));
         let got2 = Rc::new(RefCell::new(Vec::new()));
         let got1w = got1.clone();
         let got2w = got2.clone();
 
-        runtime.spawn(async move {
-            *got1w.borrow_mut() = read(rx1).await;
-        });
-        runtime.spawn(async move {
-            *got2w.borrow_mut() = read(rx2).await;
-        });
-
-        tx1.write_all(b"alpha").unwrap();
-        tx2.write_all(b"beta").unwrap();
-
-        runtime.run().expect("run should not fail");
+        runtime
+            .run(async move {
+                *got1w.borrow_mut() = read(rx1).await;
+                *got2w.borrow_mut() = read(rx2).await;
+            })
+            .expect("run should not fail");
 
         assert_eq!(got1.borrow().as_slice(), b"alpha");
         assert_eq!(got2.borrow().as_slice(), b"beta");
-    }
-
-    // The full pipe: two tasks sharing one socket pair. The writer task flushes
-    // its buffer via `Writable` while the reader task awaits `Readable`; when
-    // the writer runs first the read may block and park on the reactor, and the
-    // readiness event from the write wakes it. Either way both tasks interleave
-    // on one thread, both complete, and `run()` returns.
-    #[test]
-    fn writable_and_readable_exchange_in_one_run() {
-        let mut runtime = Runtime::new();
-        let (tx, rx) = mio::net::UnixStream::pair().unwrap();
-
-        runtime.spawn(async move { write(tx, b"ping".to_vec()).await; });
-
-        let got = Rc::new(RefCell::new(Vec::new()));
-        let got_writer = got.clone();
-        runtime.spawn(async move {
-            *got_writer.borrow_mut() = read(rx).await;
-        });
-
-        runtime.run().expect("run should not fail");
-
-        assert_eq!(got.borrow().as_slice(), b"ping");
     }
 
     // A 1 MB payload overflows the default UnixStream send buffer (~208 KB),

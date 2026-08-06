@@ -1,8 +1,8 @@
 [package]
-name = "mini-async-runtime"
+name = "mar"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 mio = { version = "0.8", features = ["os-poll", "net"] }
-reqwest = "0.12"
+reqwest = { version = "0.12", features = ["blocking"] }

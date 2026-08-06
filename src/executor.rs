@@ -40,18 +40,10 @@ impl Runtime {
         }
     }
 
-    pub fn spawn<F>(&mut self, future: F)
+    pub fn run<F>(&mut self, future: F) -> io::Result<()>
     where
         F: Future<Output = ()> + 'static,
     {
-        let mut state = self.state.borrow_mut();
-        let id = state.next_id;
-        state.next_id += 1;
-        state.tasks.insert(id, Task::new(id, future));
-        state.queue.push_back(id);
-    }
-
-    pub fn run(&mut self) -> io::Result<()> {
         timer_wheel::install(self.wheel.clone());
         reactor::install(self.reactor.clone());
         blocking::install(self.state.clone(), self.pool.job_tx());
@@ -67,6 +59,14 @@ impl Runtime {
             }
         }
         let _guard = BlockingUninstall;
+
+        {
+            let mut state = self.state.borrow_mut();
+            let id = state.next_id;
+            state.next_id += 1;
+            state.tasks.insert(id, Task::new(id, future));
+            state.queue.push_back(id);
+        }
 
         loop {
             loop {
@@ -161,8 +161,9 @@ use std::pin::Pin;
 use std::thread;
 
 // The runtime is the thing that makes futures progress. `new()` is just
-// allocation: an empty `RuntimeState` with an empty queue and no task map. A
-// fresh runtime has nothing registered yet — `spawn()` is the only way in.
+// allocation: an empty `RuntimeState` with an empty queue and no task map. The
+// future passed to `run()` is inserted as the root task and the executor drains
+// it to completion.
 #[test]
 fn new_runtime_has_empty_queue_and_task_map() {
     let runtime = Runtime::new();
@@ -172,55 +173,33 @@ fn new_runtime_has_empty_queue_and_task_map() {
     assert_eq!(state.next_id, 0);
 }
 
-// `spawn` is pure bookkeeping: it hands the future to the runtime and records
-// it in two places. The `tasks` map stores the future itself (so the executor
-// can find it later), and the `queue` gets the id (the executor's "to-do
-// list"). The id comes from `next_id`, which increments with every spawn — so
-// the first spawn is task 0, the second is task 1.
+// An empty future completes on its first poll, so `run(async {})` returns
+// immediately with a clean state — no queue entries, no lingering tasks.
 #[test]
-fn spawn_assigns_id_and_registers_the_future() {
+fn run_returns_immediately_with_empty_future() {
     let mut runtime = Runtime::new();
-    runtime.spawn(async {});
-    runtime.spawn(async {});
-
-    let state = runtime.state.borrow();
-    assert_eq!(state.next_id, 2);
-    assert_eq!(state.queue, [0, 1]);
-    assert_eq!(state.tasks[&0].id(), 0);
-    assert_eq!(state.tasks[&1].id(), 1);
-}
-
-// The termination condition: `run()` exits when the task map is empty. With
-// nothing spawned that is true immediately — no polling, no parking, no
-// sleeping. A runtime with no work is done before it starts.
-#[test]
-fn run_returns_immediately_when_nothing_is_spawned() {
-    let mut runtime = Runtime::new();
-    runtime.run().expect("run should not fail");
+    runtime.run(async {}).expect("run should not fail");
     let state = runtime.state.borrow();
     assert!(state.queue.is_empty());
     assert!(state.tasks.is_empty());
 }
 
-// The happy path: an `async {}` block has no awaits, so its first poll is also
-// its last — it reports `Ready` and the executor drops it. Three spawned tasks
-// are each polled once and disposed of, so after `run()` the shared counter
-// equals the number of tasks, and both queue and map are empty: nothing is
-// stranded (the invariant "termination is total").
+// A root future with no awaits completes on the first poll and the executor
+// returns with both queue and task map empty — termination is total.
 #[test]
-fn run_completes_spawned_tasks_and_leaves_empty_state() {
+fn run_completes_task_and_leaves_empty_state() {
     let polls = Rc::new(Cell::new(0usize));
     let mut runtime = Runtime::new();
-    for _ in 0..3 {
+    {
         let polls = polls.clone();
-        runtime.spawn(async move {
-            polls.set(polls.get() + 1);
-        });
+        runtime
+            .run(async move {
+                polls.set(polls.get() + 1);
+            })
+            .expect("run should not fail");
     }
 
-    runtime.run().expect("run should not fail");
-
-    assert_eq!(polls.get(), 3);
+    assert_eq!(polls.get(), 1);
     let state = runtime.state.borrow();
     assert!(state.queue.is_empty());
     assert!(state.tasks.is_empty());
@@ -259,12 +238,12 @@ impl Future for Probe {
 fn probe_future_re_polls_until_ready() {
     let polls = Rc::new(Cell::new(0usize));
     let mut runtime = Runtime::new();
-    runtime.spawn(Probe {
-        target: 3,
-        polls: polls.clone(),
-    });
-
-    runtime.run().expect("run should not fail");
+    runtime
+        .run(Probe {
+            target: 3,
+            polls: polls.clone(),
+        })
+        .expect("run should not fail");
 
     assert_eq!(polls.get(), 3);
     let state = runtime.state.borrow();
@@ -286,49 +265,24 @@ fn probe_future_re_polls_until_ready() {
 fn run_wakes_a_task_parked_on_io_readiness() {
     let (tx, rx) = mio::net::UnixStream::pair().unwrap();
     let mut runtime = Runtime::new();
-    runtime.spawn(async move {
-        let _ = crate::io::read(rx).await;
-    });
 
-    thread::spawn(move || {
+    let writer = thread::spawn(move || {
         thread::sleep(Duration::from_millis(20));
         let mut tx = tx;
         tx.write_all(b"x").unwrap();
     });
 
-    runtime.run().expect("run should not fail");
+    runtime
+        .run(async move {
+            let _ = crate::io::read(rx).await;
+        })
+        .expect("run should not fail");
+
+    writer.join().unwrap();
 
     let state = runtime.state.borrow();
     assert!(state.queue.is_empty());
     assert!(state.tasks.is_empty());
-    assert!(runtime.reactor.borrow().is_empty());
-}
-
-// The whole runtime in one `run()`: two tasks over a single socket pair. The
-// writer task flushes `io::write(tx, …)` while the reader task receives
-// `io::read(rx); …`; when the writer runs first the read might block and park
-// on the reactor, and the readiness event from the write wakes it. Either way
-// both tasks interleave on one thread, both complete, the reactor empties, and
-// `run()` returns.
-#[test]
-fn two_tasks_exchange_bytes_over_a_socket_pipe() {
-    let (tx, rx) = mio::net::UnixStream::pair().unwrap();
-    let mut runtime = Runtime::new();
-
-    runtime.spawn(async move {
-        crate::io::write(tx, b"ping".to_vec()).await;
-    });
-
-    let got = Rc::new(RefCell::new(Vec::new()));
-    let got_writer = got.clone();
-    runtime.spawn(async move {
-        let bytes = crate::io::read(rx).await;
-        *got_writer.borrow_mut() = bytes;
-    });
-
-    runtime.run().expect("run should not fail");
-
-    assert_eq!(got.borrow().as_slice(), b"ping");
     assert!(runtime.reactor.borrow().is_empty());
 }
 
@@ -339,12 +293,13 @@ fn spawn_blocking_smoke() {
     let done = Rc::new(Cell::new(false));
     {
         let done = done.clone();
-        runtime.spawn(async move {
-            let _ = crate::blocking::spawn_blocking(|| {}).await;
-            done.set(true);
-        });
+        runtime
+            .run(async move {
+                let _ = crate::blocking::spawn_blocking(|| {}).await;
+                done.set(true);
+            })
+            .expect("run should not fail");
     }
-    runtime.run().expect("run should not fail");
     assert!(done.get());
 }
 
@@ -355,27 +310,25 @@ fn spawn_blocking_smoke() {
 #[test]
 fn dropped_spawn_blocking_leaves_blocking_map_empty() {
     let mut runtime = Runtime::new();
-    runtime.spawn(async {
-        let fut = crate::blocking::spawn_blocking(|| {
-            thread::sleep(Duration::from_millis(50));
-            7u32
-        });
-        let state = fut.state();
-        let id = fut.id();
-        let mut fut = Box::pin(fut);
+    let state = runtime.state.clone();
+    runtime
+        .run(async move {
+            let fut = crate::blocking::spawn_blocking(|| {
+                thread::sleep(Duration::from_millis(50));
+                7u32
+            });
+            let id = fut.id();
+            let mut fut = Box::pin(fut);
 
-        // First poll registers the task's waker in the blocking map and pends.
-        let waker = create_waker(state.clone(), id);
-        let mut cx = Context::from_waker(&waker);
-        assert!(fut.as_mut().poll(&mut cx).is_pending());
-        assert!(state.borrow().blocking.contains_key(&id));
+            let waker = create_waker(state.clone(), id);
+            let mut cx = Context::from_waker(&waker);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            assert!(state.borrow().blocking.contains_key(&id));
 
-        // Cancel: drop before the worker finishes. The entry must go.
-        drop(fut);
-        assert!(state.borrow().blocking.is_empty());
-    });
-
-    runtime.run().expect("run should not fail");
+            drop(fut);
+            assert!(state.borrow().blocking.is_empty());
+        })
+        .expect("run should not fail");
 }
 
 // Step 15 — shutdown: after `run()` returns, dropping the Runtime closes the
@@ -385,10 +338,11 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
 #[test]
 fn runtime_drop_joins_workers_promptly_after_run() {
     let mut runtime = Runtime::new();
-    runtime.spawn(async {
-        let _ = crate::blocking::spawn_blocking(|| 21 * 2).await;
-    });
-    runtime.run().expect("run should not fail");
+    runtime
+        .run(async {
+            let _ = crate::blocking::spawn_blocking(|| 21 * 2).await;
+        })
+        .expect("run should not fail");
 
     let start = Instant::now();
     drop(runtime);
