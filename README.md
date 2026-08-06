@@ -11,41 +11,16 @@ read, understood, and held in your head at once.
 
 ## The big picture
 
-```
+```mermaid
 flowchart LR
-    subgraph User["Your program"]
-        Root["Root future<br/>(passed to Mar::run)"]
+    Root["your root future"] -->|"Mar::run(future)"| Loop
+
+    subgraph Mar["mar runtime — one OS thread"]
+        Loop["event loop<br/>poll · park · wake"]
+        Drivers["drivers<br/>timer wheel · reactor · worker pool"]
+        Loop -->|"Pending tasks wait here"| Drivers
+        Drivers -->|"events wake tasks back up"| Loop
     end
-
-    subgraph Executor["mar::Mar — the executor"]
-        Queue["Ready queue<br/>(task ids to poll)"]
-        Tasks["Task map<br/>(id → task)"]
-        Loop["Event loop<br/>(poll, park, wake)"]
-    end
-
-    subgraph Drivers["The drivers that wake tasks"]
-        Wheel["Timer wheel<br/>(sleep, yield_now)"]
-        Reactor["Reactor<br/>(mio::Poll + I/O readiness)"]
-        Pool["Worker pool<br/>(spawn_blocking threads)"]
-    end
-
-    Root -->|"is inserted as the root task"| Loop
-    Queue <--> Loop
-    Tasks <--> Loop
-
-    Loop -->|"park with next timer deadline"| Wheel
-    Wheel -->|"expire due timers → requeue ids"| Queue
-    Loop -->|"wait for I/O readiness"| Reactor
-    Reactor -->|"ready event → wake parked task"| Queue
-    Pool -->|"worker done → wake via mio::Waker"| Queue
-    Pool <-->|"spawn_blocking closure + result"| Loop
-
-    classDef ex fill:#eef,stroke:#669;
-    classDef drv fill:#efe,stroke:#696;
-    classDef loop fill:#ffe,stroke:#996;
-    class Root ex;
-    class Wheel,Reactor,Pool drv;
-    class Loop loop;
 ```
 
 ## Main components
