@@ -1,5 +1,5 @@
 use mar::Mar;
-
+use rrest::Rrest;
 // The whole program is a single future passed to `Mar::run()`: fetch the
 // body asynchronously via rrest, write it to examples/get-data.json, read it
 // back, and print it.
@@ -9,7 +9,7 @@ use mar::Mar;
 fn main() {
     Mar::run(async move {
         let url = "https://jsonplaceholder.typicode.com/todos/1";
-        let response = rrest::Rrest::get(url).await.expect("GET failed");
+        let response = Rrest::get(url).await.expect("GET failed");
         let body = String::from_utf8(response.body().clone()).expect("invalid UTF-8");
 
         let output = std::env::current_exe()
