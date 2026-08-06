@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mar::Mar;
 use mar::task::spawn_blocking;
@@ -6,17 +6,19 @@ use mar::time::sleep;
 
 fn main() {
     Mar::run(async move {
-        let job_a = spawn_blocking(|| {
+        let start = Instant::now();
+
+        let job_1 = spawn_blocking(|| {
             std::thread::sleep(Duration::from_millis(200));
-            "alpha"
+            "job 1"
         });
-        let job_b = spawn_blocking(|| {
+        let job_2 = spawn_blocking(|| {
             std::thread::sleep(Duration::from_millis(300));
-            "beta"
+            "job 2"
         });
-        let job_c = spawn_blocking(|| {
+        let job_3 = spawn_blocking(|| {
             std::thread::sleep(Duration::from_millis(250));
-            "gamma"
+            "job 3"
         });
 
         println!("dispatched 3 jobs");
@@ -26,7 +28,16 @@ fn main() {
             println!("  tick {i}");
         }
 
-        println!("{} {} {}", job_a.await, job_b.await, job_c.await);
+        let r1 = job_1.await;
+        println!("{r1} done — {:?}", start.elapsed());
+
+        let r2 = job_2.await;
+        println!("{r2} done — {:?}", start.elapsed());
+
+        let r3 = job_3.await;
+        println!("{r3} done — {:?}", start.elapsed());
+
+        println!("total: {:?}", start.elapsed());
     })
     .expect("run failed");
 }
