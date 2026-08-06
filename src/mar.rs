@@ -149,12 +149,6 @@ impl Mar {
     }
 }
 
-impl Default for Mar {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 use std::cell::Cell;
 #[cfg(test)]
@@ -243,7 +237,7 @@ fn probe_future_re_polls_until_ready() {
 
 // A task parked on a socket: the I/O analogue of `Sleep`, now provided by the
 // public `io::read` future. On its first `WouldBlock` poll it reaches the
-// shared reactor through the thread-local `reactor::with` accessor, registering
+    // shared reactor through the thread-local `context::with` accessor, registering
 // the read end with the poller and storing its waker under a token allocated by
 // the reactor; returning `Pending` makes the executor park the thread. A write
 // on the other end of the socket pair — from another thread — fires the
@@ -276,7 +270,7 @@ fn spawn_blocking_smoke() {
     {
         let done = done.clone();
         Mar::run(async move {
-            let _ = crate::task::blocking::spawn_blocking(|| {}).await;
+            let _ = crate::task::spawn_blocking(|| {}).await;
             done.set(true);
         })
         .expect("run should not fail");
@@ -285,10 +279,10 @@ fn spawn_blocking_smoke() {
 }
 
 // Phase 3 Drop test: a BlockingTask dropped before completion removes its
-// entry from `RuntimeState::blocking`. If it did not, the executor's
-// termination check (`blocking.is_empty()`) would never pass and `run()`
+// entry from `RuntimeState::blocking_wakers`. If it did not, the executor's
+// termination check (`blocking_wakers.is_empty()`) would never pass and `run()`
 // would park forever. Runs against a hand-installed runtime handle so the
-// blocking map can be inspected directly.
+// blocking_wakers map can be inspected directly.
 #[test]
 fn dropped_spawn_blocking_leaves_blocking_map_empty() {
     let poll = mio::Poll::new().unwrap();
@@ -302,7 +296,7 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
         job_tx: pool.job_tx(),
     });
 
-    let fut = crate::task::blocking::spawn_blocking(|| {
+    let fut = crate::task::spawn_blocking(|| {
         thread::sleep(Duration::from_millis(50));
         7u32
     });
@@ -328,7 +322,7 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
 fn runtime_drop_joins_workers_promptly_after_run() {
     let start = Instant::now();
     Mar::run(async {
-        let _ = crate::task::blocking::spawn_blocking(|| 21 * 2).await;
+        let _ = crate::task::spawn_blocking(|| 21 * 2).await;
     })
     .expect("run should not fail");
     assert!(start.elapsed() < Duration::from_millis(500));

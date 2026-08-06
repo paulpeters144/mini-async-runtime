@@ -181,7 +181,7 @@ mod tests {
     // A write on the tx end makes the rx end readable; `read` returns exactly
     // the bytes that were written.
     #[test]
-    fn readable_returns_bytes_from_pair() {
+    fn read_returns_bytes_from_pair() {
         let (mut tx, rx) = mio::net::UnixStream::pair().unwrap();
         tx.write_all(b"hello").unwrap();
 
@@ -200,7 +200,7 @@ mod tests {
     // deregistered and reclaimed, and `run()` can return with an empty reactor.
     // This proves an already-readable socket does not leak a registration.
     #[test]
-    fn readable_from_an_unparked_source_completes() {
+    fn read_from_an_unparked_source_completes() {
         let (mut tx, rx) = mio::net::UnixStream::pair().unwrap();
         tx.write_all(b"x").unwrap();
 
@@ -221,7 +221,7 @@ mod tests {
     // plain non-async `read`). Small writes complete on the first poll without
     // ever registering with the reactor — `WriteFuture` returns `Ready` immediately.
     #[test]
-    fn writable_flushes_bytes_to_pair() {
+    fn write_flushes_bytes_to_pair() {
         let (tx, mut rx) = mio::net::UnixStream::pair().unwrap();
 
         Mar::run(async move {
@@ -239,7 +239,7 @@ mod tests {
     // token allocator hands out distinct tokens so the two `ReadFuture` futures
     // do not collide on the shared poller.
     #[test]
-    fn readable_and_writable_coexist_on_separate_pairs() {
+    fn read_and_write_coexist_on_separate_pairs() {
         let (mut tx1, rx1) = mio::net::UnixStream::pair().unwrap();
         let (mut tx2, rx2) = mio::net::UnixStream::pair().unwrap();
         tx1.write_all(b"alpha").unwrap();
@@ -265,7 +265,7 @@ mod tests {
     // future must store its waker so the reactor can wake it when buffer space
     // frees up.
     #[test]
-    fn writable_partial_write_stores_waker() {
+    fn write_partial_write_stores_waker() {
         use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
         let reactor = Rc::new(RefCell::new(crate::reactor::Reactor::new()));

@@ -35,8 +35,8 @@ The reactor has a split personality, and the split matters:
 
 1. **Registration side** — *who* is waiting. `register_source(source, token,
    interest)` registers an OS source with the poller; `register(token, waker)`
-   records which task's waker fires when that token goes ready. `deregister` /
-   `deregister_source` remove them.
+   records which task's waker fires when that token goes ready.
+   `deregister_source` removes both the source and its waker.
 2. **Event side** — *what happened*. `park(events, timeout)` blocks the thread
    on `mio::Poll::poll`. `dispatch(handle, events)` walks the returned events
    and, for each token, looks up the registered waker and calls `wake_by_ref()`.
@@ -49,7 +49,7 @@ their `poll`; the executor calls `park` when the ready queue is drained and
 
 `mio::Poll` is level-triggered: a source that stays ready keeps producing
 events on every `park` until it is deregistered. Dispatching an event does *not*
-remove the waker from the registry. Only an explicit `deregister` (the I/O
+remove the waker from the registry. Only an explicit `deregister_source` (the I/O
 wrapper's `Drop`/completion discipline — see [io.md](io.md)) empties the
 registry. That explicit cleanup is exactly what lets the executor's termination
 check pass: `reactor.is_empty()` is true only when no task is parked.
@@ -65,7 +65,7 @@ our wake discipline.
 
 `dispatch` *skips* `Token(0)`. The `WAKEN_TOKEN` event is handled separately by
 the executor: when it appears, `run` wakes every waker in
-`RuntimeState::blocking`. This is how a worker thread's completion reaches the
+`RuntimeState::blocking_wakers`. This is how a worker thread's completion reaches the
 executor thread — through `mio::Waker`, which is specifically designed to fire
 a token from any thread.
 

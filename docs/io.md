@@ -34,7 +34,7 @@ re-queues the task. The next poll succeeds at step 2 and completes.
 
 If a `ReadFuture` is dropped before completing, its `Drop` impl deregisters the
 source from the poller *and* removes the waker from the reactor's registry.
-This is the same cancellation discipline as `Sleep` in the timer wheel: a stale
+This is the same cancellation discipline as `time::Sleep`: a stale
 registration would otherwise block the termination check forever.
 
 ## `WriteFuture` — `io::write(src, buf)`
@@ -50,7 +50,7 @@ accept only *part* of a buffer before blocking:
    `Interest::WRITABLE`, store the waker, return `Pending`. The future remembers
    its `offset`, so the next poll resumes exactly where it left off.
 
-The 1 MiB test in `io.rs` (`writable_partial_write_stores_waker`) is what
+The 1 MiB test in `io.rs` (`write_partial_write_stores_waker`) is what
 exercises this: a large payload overflows the socket's send buffer, forcing a
 partial write and a parked `WriteFuture` whose waker must be stored.
 
@@ -77,13 +77,13 @@ shared reactor via the single thread-local context.
 
 ## Key tests to read
 
-- `readable_returns_bytes_from_pair` — end-to-end: write to one end of a
+- `read_returns_bytes_from_pair` — end-to-end: write to one end of a
   `UnixStream` pair, `io::read` the other, assert the bytes.
-- `readable_from_an_unparked_source_completes` — data already buffered means no
+- `read_from_an_unparked_source_completes` — data already buffered means no
   registration ever happens; the reactor stays empty.
-- `writable_flushes_bytes_to_pair` — a small write completes on the first poll
+- `write_flushes_bytes_to_pair` — a small write completes on the first poll
   with no reactor involvement at all.
-- `readable_and_writable_coexist_on_separate_pairs` — two active registrations
+- `read_and_write_coexist_on_separate_pairs` — two active registrations
   at once, proving the token allocator prevents collisions.
-- `writable_partial_write_stores_waker` — the partial-write case that forces a
+- `write_partial_write_stores_waker` — the partial-write case that forces a
   parked `WriteFuture`.

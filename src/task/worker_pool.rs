@@ -35,8 +35,8 @@ impl WorkerPool {
                             // A panicking job must not kill the worker — a dead
                             // worker would silently strand every future job.
                             // `spawn_blocking` jobs already catch their own
-                            // panics and ship the payload; this guard covers
-                            // raw `submit()` jobs. Either way: wake and keep
+                            // panics and ship the payload; this guard is
+                            // defense-in-depth. Either way: wake and keep
                             // serving.
                             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                             let _ = w.wake();
@@ -53,20 +53,8 @@ impl WorkerPool {
         }
     }
 
-    /// Send a closure to a worker thread. The closure runs once and its result
-    /// is discarded — the caller should arrange its own back-channel for the
-    /// return value (typically an `mpsc::channel` inside `spawn_blocking`).
-    #[allow(dead_code)]
-    pub(crate) fn submit(&self, job: Job) {
-        self.job_tx
-            .as_ref()
-            .expect("worker pool shut down")
-            .send(job)
-            .expect("worker thread panicked");
-    }
-
-    /// Return a clone of the job sender — used by `blocking::install()` to
-    /// give the thread-local handle a way to submit work.
+    /// Return a clone of the job sender — used by `spawn_blocking` (via the
+    /// thread-local context) and by the pool's own tests.
     pub(crate) fn job_tx(&self) -> mpsc::Sender<Job> {
         self.job_tx.as_ref().expect("worker pool shut down").clone()
     }
@@ -101,9 +89,11 @@ mod tests {
         let pool = WorkerPool::new(make_waker());
 
         let c = counter.clone();
-        pool.submit(Box::new(move || {
-            c.store(42, Ordering::SeqCst);
-        }));
+        pool.job_tx()
+            .send(Box::new(move || {
+                c.store(42, Ordering::SeqCst);
+            }))
+            .unwrap();
 
         // The job runs asynchronously.  Drop the pool to wait for the worker
         // to finish, then read the counter.
@@ -124,20 +114,24 @@ mod tests {
         {
             let seq = seq.clone();
             let b = barrier.clone();
-            pool.submit(Box::new(move || {
-                b.wait();
-                seq.fetch_add(1, Ordering::SeqCst);
-                thread::sleep(Duration::from_millis(100));
-            }));
+            pool.job_tx()
+                .send(Box::new(move || {
+                    b.wait();
+                    seq.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(100));
+                }))
+                .unwrap();
         }
         {
             let seq = seq.clone();
             let b = barrier.clone();
-            pool.submit(Box::new(move || {
-                b.wait();
-                seq.fetch_add(1, Ordering::SeqCst);
-                thread::sleep(Duration::from_millis(100));
-            }));
+            pool.job_tx()
+                .send(Box::new(move || {
+                    b.wait();
+                    seq.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(100));
+                }))
+                .unwrap();
         }
 
         // The pool is consumed to join the workers.
@@ -158,17 +152,19 @@ mod tests {
         drop(pool);
     }
 
-    // Jobs submitted before drop still run before the worker exits.
+    // Jobs sent before drop still run before the worker exits.
     #[test]
-    fn jobs_submitted_before_drop_complete() {
+    fn jobs_sent_before_drop_complete() {
         let pool = WorkerPool::new(make_waker());
         let counter = Arc::new(AtomicUsize::new(0));
 
         for _ in 0..3 {
             let c = counter.clone();
-            pool.submit(Box::new(move || {
-                c.fetch_add(1, Ordering::SeqCst);
-            }));
+            pool.job_tx()
+                .send(Box::new(move || {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }))
+                .unwrap();
         }
 
         drop(pool);

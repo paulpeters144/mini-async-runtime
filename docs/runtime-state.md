@@ -4,15 +4,15 @@ Source: [`src/runtime_state.rs`](../src/runtime_state.rs)
 
 `RuntimeState` is a tiny struct holding everything the executor must share while
 it runs. It is deliberately boring — no logic, just data — so the interesting
-bits of the runtime (the waker, the timer wheel, the reactor) all talk to one
+bits of the runtime (the waker, the timer heap, the reactor) all talk to one
 another through one well-known object.
 
 ```rust
 pub struct RuntimeState {
-    pub queue: VecDeque<usize>,        // ready queue: task ids to poll next
-    pub tasks: HashMap<usize, Task>,   // live tasks, keyed by id
-    pub next_id: usize,                // the id counter for new tasks
-    pub blocking: HashMap<usize, Waker>, // tasks waiting on worker results
+    pub queue: VecDeque<usize>,            // ready queue: task ids to poll next
+    pub tasks: HashMap<usize, Task>,       // live tasks, keyed by id
+    pub next_id: usize,                    // the id counter for new tasks
+    pub blocking_wakers: HashMap<usize, Waker>, // tasks waiting on worker results
 }
 ```
 
@@ -48,7 +48,7 @@ Task ids are never reused. The root task gets `0`; every subsequent task gets
 `next_id`, then `next_id += 1`. Distinct ids are what keep wakers unambiguous:
 a waker for task `7` can only ever mean task `7`.
 
-## The blocking map (`blocking`)
+## The blocking-waker map (`blocking_wakers`)
 
 `HashMap<usize, Waker>` of tasks that are waiting on a worker thread's result.
 `spawn_blocking` inserts the waiting task's waker here; when a worker finishes,

@@ -49,10 +49,6 @@ impl Reactor {
         self.registry.insert(token, waker);
     }
 
-    pub fn deregister(&mut self, token: mio::Token) {
-        self.registry.remove(&token);
-    }
-
     /// Register a source with the poller so its readiness fires `token` events.
     ///
     /// The I/O wrapper futures call this (via `with`) instead of touching the
@@ -133,13 +129,19 @@ mod tests {
         let mut reactor = Reactor::new();
         assert!(reactor.is_empty());
 
+        let (_tx, mut rx) = mio::net::UnixStream::pair().unwrap();
+        let token = reactor.allocate_token();
+        reactor
+            .register_source(&mut rx, token, Interest::READABLE)
+            .unwrap();
+
         let state = RuntimeState::new();
         let waker = create_waker(state.clone(), 1);
-        reactor.register(Token(7), waker);
+        reactor.register(token, waker);
 
         assert!(!reactor.is_empty());
 
-        reactor.deregister(Token(7));
+        reactor.deregister_source(&mut rx, token).unwrap();
         assert!(reactor.is_empty());
     }
 
@@ -225,8 +227,8 @@ mod tests {
 
     // Level-triggered readiness: dispatching an event does NOT remove the waker
     // from the registry, so a still-readable source keeps waking its task on
-    // every park. Only an explicit `deregister` (the I/O wrapper's `Drop`
-    // discipline, mirroring the timer wheel) empties the registry — and that is
+    // every park. Only an explicit `deregister_source` (the I/O wrapper's `Drop`
+    // discipline) empties the registry — and that is
     // exactly what lets the executor's termination check pass.
     #[test]
     fn events_keep_waking_until_the_task_deregisters() {
@@ -261,8 +263,7 @@ mod tests {
 
         // The task deregisters: the fd leaves the OS poller and the waker
         // leaves the registry, so the reactor is empty again.
-        rx.deregister(handle.borrow().registry()).unwrap();
-        handle.borrow_mut().deregister(Token(1));
+        handle.borrow_mut().deregister_source(&mut rx, Token(1)).unwrap();
         assert!(handle.borrow().is_empty());
     }
 }

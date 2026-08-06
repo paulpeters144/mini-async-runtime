@@ -17,7 +17,7 @@ flowchart LR
 
     subgraph Mar["mar runtime — one OS thread"]
         Loop["event loop<br/>poll · park · wake"]
-        Drivers["drivers<br/>timer wheel · reactor · worker pool"]
+        Drivers["drivers<br/>timer heap · reactor · worker pool"]
         Loop -->|"Pending tasks wait here"| Drivers
         Drivers -->|"events wake tasks back up"| Loop
     end

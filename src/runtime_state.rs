@@ -4,7 +4,6 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::task::Waker;
 
-#[derive(Default)]
 pub struct RuntimeState {
     pub queue: VecDeque<usize>,
     pub tasks: HashMap<usize, Task>,
