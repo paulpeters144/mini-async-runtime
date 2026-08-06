@@ -3,8 +3,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use mar::Mar;
-use mar::blocking::spawn_blocking;
-use mar::timer_wheel::sleep;
+use mar::task::spawn_blocking;
+use mar::time::sleep;
 
 // Phase 3 milestone: `spawn_blocking` interleaves with a timer. `spawn_blocking`
 // eagerly sends the job to a worker so the 200ms closure starts running before
@@ -27,7 +27,7 @@ fn spawn_blocking_interleaves_with_timer() {
             });
 
             // Worker is already running the 200ms closure. Park on the
-            // timer wheel for 50ms while the worker keeps ticking.
+            // timer heap for 50ms while the worker keeps ticking.
             sleep(Duration::from_millis(50)).await;
             timer_fired.set(true);
 

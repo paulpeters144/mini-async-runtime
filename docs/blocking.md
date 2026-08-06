@@ -1,10 +1,11 @@
-# Blocking work (`mar::blocking`)
+# Blocking work (`mar::task::spawn_blocking`)
 
-Source: [`src/blocking.rs`](../src/blocking.rs)
+Source: [`src/task/blocking.rs`](../src/task/blocking.rs) (pool at [`src/task/worker_pool.rs`](../src/task/worker_pool.rs))
 
-`blocking` lets user code run CPU-heavy or genuinely blocking work (file I/O, a
-`reqwest` HTTP call, a long computation) without stalling the executor thread.
-It is the runtime's one multi-threaded corner, and it's carefully isolated.
+`spawn_blocking` lets user code run CPU-heavy or genuinely blocking work (file
+I/O, a `reqwest` HTTP call, a long computation) without stalling the executor
+thread. It is the runtime's one multi-threaded corner, and it's carefully
+isolated.
 
 ## Two pieces
 
@@ -41,7 +42,7 @@ Two details matter:
 - **Cross-thread wakeup.** The shared `mio::Waker` is created by `Mar::new`
   and registered with the reactor under `WAKEN_TOKEN` (`Token(0)`). When a
   worker calls `wake()`, `mio` fires that token in the executor thread, which
-  then wakes every task in the blocking map.
+  then wakes every task in the blocking-waker map.
 
 `Drop` closes the job channel and joins the workers — the runtime's shutdown
 path. If any job sender leaked, `join()` would block forever.
@@ -50,17 +51,18 @@ path. If any job sender leaked, `join()` would block forever.
 
 `spawn_blocking(|| …)` is the ergonomic entry point:
 
-1. Reads the *current task id* from the thread-local (installed by `run()`,
-   set by the executor just before polling — the same mechanism `sleep()` uses).
-2. Creates an `mpsc` result channel.
-3. Sends a closure to the pool that runs the user's closure inside
+1. Reads the shared state and job channel from the thread-local context
+   (installed by `run()`).
+2. Self-assigns a fresh blocking id from `RuntimeState::next_blocking_id`.
+3. Creates an `mpsc` result channel.
+4. Sends a closure to the pool that runs the user's closure inside
    `catch_unwind` and ships the outcome (`Result<R, panic payload>`) back over
    the channel.
-4. Returns a `BlockingTask<R>` future.
+5. Returns a `BlockingTask<R>` future.
 
 When awaited, the future's poll:
 
-- **First poll:** registers its waker in `RuntimeState::blocking`, then
+- **First poll:** registers its waker in `RuntimeState::blocking_wakers`, then
   `try_recv()`s the result channel:
   - `Empty` → `Pending`. The executor parks; the worker is still running.
   - `Ok(Ok(value))` → remove the blocking entry, `Poll::Ready(value)`.
@@ -73,8 +75,9 @@ When awaited, the future's poll:
 ### Cancellation
 
 Dropping a `BlockingTask` before completion removes its entry from
-`RuntimeState::blocking`. Without this, the termination check
-(`blocking.is_empty()`) would fail forever and `run()` would park forever.
+`RuntimeState::blocking_wakers`. Without this, the termination check
+(`blocking_wakers.is_empty()`) would fail forever and `run()` would park
+forever.
 
 ## How the pieces fit together
 
@@ -82,7 +85,7 @@ Dropping a `BlockingTask` before completion removes its entry from
 user future ── spawn_blocking(|| …) ──> BlockingTask
                                             │ first poll
                                             ▼
-                          RuntimeState::blocking ← waker registered
+                          RuntimeState::blocking_wakers ← waker registered
                                             │
                               worker thread runs closure
                                             │
@@ -110,6 +113,5 @@ lets blocking work and timers interleave (see `tests/core.rs`).
   test: a 200ms blocking job + a 50ms `sleep` finish in ~200ms, not 250ms.
 - `panicking_blocking_closure_makes_run_panic` (`tests/core.rs`) — the panic
   payload crosses the boundary and is rethrown on the executor side.
-- `dropped_spawn_blocking_leaves_blocking_map_empty` (in
-  [executor.md](executor.md)'s module) — cancellation cleans up the blocking
-  map.
+- `dropped_spawn_blocking_leaves_blocking_map_empty` (in the executor module) —
+  cancellation cleans up the blocking-waker map.

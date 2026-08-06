@@ -3,7 +3,7 @@
 `mar` is a small, from-scratch async runtime for Rust, written to teach how
 runtimes like tokio work under the hood. It implements the full stack you need
 to run `async/await` code on one thread: an executor that polls futures, a
-timer wheel for `sleep`, a reactor that waits on OS readiness for I/O, and a
+timer heap for `sleep`, a reactor that waits on OS readiness for I/O, and a
 worker pool for blocking work.
 
 Everything is kept deliberately small and single-threaded so each piece can be
@@ -42,11 +42,13 @@ Every future is polled with a `Waker`. This one is built from scratch on an
 `Rc<RefCell<…>>` — the whole runtime is single-threaded, so no `Arc` or locks
 are needed. Waking a task just pushes its id onto the ready queue.
 
-### Timer wheel — `sleep` and `yield_now`
-A priority queue of `(deadline, task id)` shared by the executor and every
+### Timer heap — `sleep` (and `yield_now`)
+A priority queue of `(deadline, id, Waker)` shared by the executor and every
 sleeping future. `Mar` uses the earliest deadline to decide how long to park;
-when a deadline passes, the task's id is put back on the ready queue. A dropped
-`sleep` removes its entry, so a cancelled timer can never hang the loop.
+when a deadline passes, the waker stored in the entry fires and the task's id
+lands back on the ready queue. A dropped `sleep` removes its entry, so a
+cancelled timer can never hang the loop. `yield_now()` lives in
+`mar::task::yield_now` — it self-wakes without touching the timer heap.
 
 ### Reactor — I/O readiness
 Wraps `mio::Poll`, the OS-level poller, so the executor can wait for sockets to
@@ -62,11 +64,11 @@ closure to a worker and returns a future that completes with the result. When a
 worker finishes it signals the executor through a cross-thread waker, and the
 blocking task's id lands back on the ready queue.
 
-### Thread-local plumbing
+### Thread-local context
 Free functions like `sleep()`, `yield_now()`, `io::read`, and `spawn_blocking`
 need to reach the runtime's internals without taking explicit handles. `run()`
-installs them in thread-locals (the same pattern tokio uses), so user code
-stays ergonomic and the wiring stays invisible.
+installs a single `ContextHandle` in a thread-local slot (the same pattern tokio
+uses), so user code stays ergonomic and the wiring stays invisible.
 
 ## The run cycle, in one paragraph
 
@@ -75,8 +77,8 @@ and re-enqueues itself, or finishes. When the queue is empty it computes the
 next timer deadline and parks on the reactor — the thread sleeps until a timer
 fires, a socket becomes ready, or a worker finishes. Each event wakes the
 matching task back onto the queue, and the loop repeats. When the queue, task
-map, timer wheel, reactor, and worker pool are all empty, the runtime shuts
-down and `run()` returns.
+map, timer heap, reactor, and blocking-waker map are all empty, the runtime
+shuts down and `run()` returns.
 
 ## Design choices, on purpose
 
@@ -96,9 +98,9 @@ Each example highlights one way the pieces combine:
 
 | Example | What it shows |
 | --- | --- |
-| `examples/countdown.rs` | Timer wheel only — a stopwatch that counts down with `sleep` |
+| `examples/countdown.rs` | Timer heap only — a stopwatch that counts down with `sleep` |
 | `examples/compute_with_spinner.rs` | `spawn_blocking` running a long job in parallel with a `sleep`-based progress spinner |
-| `examples/retry_with_backoff.rs` | `spawn_blocking` + timer wheel — retries with exponential backoff |
+| `examples/retry_with_backoff.rs` | `spawn_blocking` + timer heap — retries with exponential backoff |
 | `examples/fetch_to_file.rs` | `spawn_blocking` for HTTP and file I/O — fetch, write, read back |
 | `examples/local_echo_server.rs` | Reactor + worker pool — accepts connections with `spawn_blocking`, relays bytes with `io::read`/`io::write` |
 
@@ -113,13 +115,17 @@ cargo run --example countdown
 ```
 src/
   mar.rs          the executor and public entry point
-  task.rs         a pollable future, tagged with an id
-  runtime_state.rs  the shared ready queue, task map, and blocking map
+  task/           Task, spawn_blocking, yield_now, worker pool
+    mod.rs        Task struct + re-exports
+    blocking.rs   BlockingTask + spawn_blocking
+    yield_now.rs  YieldNow + yield_now()
+    worker_pool.rs  WorkerPool + Job
+  context.rs      single thread-local context for all free functions
+  runtime_state.rs  the shared ready queue, task map, and blocking-waker map
   waker.rs        the hand-built waker used by the executor
-  timer_wheel.rs  sleep, yield_now, and the deadline heap
+  time.rs         sleep and the TimerHeap deadline heap
   reactor.rs      mio::Poll wrapper, token allocation, event dispatch
   io.rs           one-shot read/write futures
-  blocking.rs     worker pool and spawn_blocking
 tests/
   core.rs         integration tests: interleaving blocking work with timers
 examples/         runnable demos, see table above
@@ -135,9 +141,9 @@ how it interacts with the rest, and which tests document its behavior:
 | --- | --- |
 | [docs/executor.md](docs/executor.md) | `Mar` — the executor and its event loop |
 | [docs/task.md](docs/task.md) | `Task` — a pollable future, tagged with an id |
-| [docs/runtime-state.md](docs/runtime-state.md) | `RuntimeState` — ready queue, task map, blocking map |
+| [docs/runtime-state.md](docs/runtime-state.md) | `RuntimeState` — ready queue, task map, blocking-waker map |
 | [docs/waker.md](docs/waker.md) | The hand-built waker |
-| [docs/timer-wheel.md](docs/timer-wheel.md) | Timer wheel — `sleep`, `yield_now`, the deadline heap |
+| [docs/time.md](docs/time.md) | Timer heap — `sleep` and the deadline heap |
 | [docs/reactor.md](docs/reactor.md) | Reactor — `mio::Poll` wrapper, tokens, dispatch |
 | [docs/io.md](docs/io.md) | `io::read` / `io::write` one-shot futures |
 | [docs/blocking.md](docs/blocking.md) | `WorkerPool` and `spawn_blocking` |

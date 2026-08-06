@@ -1,10 +1,10 @@
-use crate::blocking;
+use crate::context;
 use crate::reactor::{self, Reactor, ReactorHandle, WAKEN_TOKEN};
 use crate::runtime_state::RuntimeState;
 use crate::task::Task;
-use crate::timer_wheel::{self, TimerWheel};
+use crate::time::{self, TimerHeap};
 use crate::waker::create_waker;
-use crate::worker_pool::WorkerPool;
+use crate::task::worker_pool::WorkerPool;
 use std::cell::RefCell;
 use std::future::Future;
 use std::io::{self};
@@ -14,17 +14,17 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 pub struct Mar {
-    state: Rc<RefCell<RuntimeState>>,
-    wheel: TimerWheel,
+    pub(crate) state: Rc<RefCell<RuntimeState>>,
+    pub(crate) wheel: Rc<TimerHeap>,
     pub(crate) reactor: ReactorHandle,
-    pool: WorkerPool,
+    pub(crate) pool: WorkerPool,
     events: mio::Events,
 }
 
 impl Mar {
     pub(crate) fn new() -> Self {
         let state = RuntimeState::new();
-        let wheel = Rc::new(RefCell::new(std::collections::BinaryHeap::new()));
+        let wheel = Rc::new(TimerHeap::new());
         let reactor = Rc::new(RefCell::new(Reactor::new()));
         let pool = {
             let reactor_ref = reactor.borrow();
@@ -47,21 +47,24 @@ impl Mar {
     {
         let mut runtime = Self::new();
 
-        timer_wheel::install(runtime.wheel.clone());
-        reactor::install(runtime.reactor.clone());
-        blocking::install(runtime.state.clone(), runtime.pool.job_tx());
+        context::install(context::ContextHandle {
+            state: runtime.state.clone(),
+            reactor: runtime.reactor.clone(),
+            wheel: runtime.wheel.clone(),
+            job_tx: runtime.pool.job_tx(),
+        });
 
         // Panic safety: if a task poll panics (e.g. a blocking closure's
         // payload is resumed inside `poll`), unwinding must still release the
         // thread-local job sender. Otherwise `WorkerPool::drop` would block
         // forever joining a worker whose channel never closed.
-        struct BlockingUninstall;
-        impl Drop for BlockingUninstall {
+        struct ContextGuard;
+        impl Drop for ContextGuard {
             fn drop(&mut self) {
-                blocking::uninstall();
+                context::uninstall();
             }
         }
-        let _guard = BlockingUninstall;
+        let _guard = ContextGuard;
 
         {
             let mut state = runtime.state.borrow_mut();
@@ -87,7 +90,6 @@ impl Mar {
                     None => continue,
                 };
 
-                timer_wheel::set_current_id(id);
                 let waker = create_waker(runtime.state.clone(), id);
                 let mut cx = Context::from_waker(&waker);
                 match task.poll(&mut cx) {
@@ -96,23 +98,21 @@ impl Mar {
                     }
                     Poll::Ready(()) => {}
                 }
-                timer_wheel::clear_current_id();
             }
 
             let done = {
                 let state = runtime.state.borrow();
-                let wheel = runtime.wheel.borrow();
                 let reactor = runtime.reactor.borrow();
                 state.tasks.is_empty()
-                    && wheel.is_empty()
+                    && runtime.wheel.is_empty()
                     && reactor.is_empty()
-                    && state.blocking.is_empty()
+                    && state.blocking_wakers.is_empty()
             };
             if done {
                 return Ok(());
             }
 
-            let timeout = timer_wheel::next_deadline(&runtime.wheel).map(|deadline| {
+            let timeout = time::next_deadline(&runtime.wheel).map(|deadline| {
                 let now = Instant::now();
                 if deadline > now {
                     deadline - now
@@ -125,9 +125,7 @@ impl Mar {
                 .borrow_mut()
                 .park(&mut runtime.events, timeout)?;
 
-            for id in timer_wheel::expire_due(&runtime.wheel) {
-                runtime.state.borrow_mut().queue.push_back(id);
-            }
+            time::expire_due(&runtime.wheel);
 
             for event in runtime.events.iter() {
                 if event.token() == WAKEN_TOKEN {
@@ -138,7 +136,7 @@ impl Mar {
                     // and panics.
                     let wakers: Vec<Waker> = {
                         let state = runtime.state.borrow();
-                        state.blocking.values().cloned().collect()
+                        state.blocking_wakers.values().cloned().collect()
                     };
                     for waker in &wakers {
                         waker.wake_by_ref();
@@ -278,7 +276,7 @@ fn spawn_blocking_smoke() {
     {
         let done = done.clone();
         Mar::run(async move {
-            let _ = crate::blocking::spawn_blocking(|| {}).await;
+            let _ = crate::task::blocking::spawn_blocking(|| {}).await;
             done.set(true);
         })
         .expect("run should not fail");
@@ -293,16 +291,18 @@ fn spawn_blocking_smoke() {
 // blocking map can be inspected directly.
 #[test]
 fn dropped_spawn_blocking_leaves_blocking_map_empty() {
-    timer_wheel::install(Rc::new(RefCell::new(std::collections::BinaryHeap::new())));
-    timer_wheel::set_current_id(1);
-
     let poll = mio::Poll::new().unwrap();
     let waker = Arc::new(mio::Waker::new(poll.registry(), WAKEN_TOKEN).unwrap());
     let pool = WorkerPool::new(waker);
     let state = RuntimeState::new();
-    blocking::install(state.clone(), pool.job_tx());
+    context::install(context::ContextHandle {
+        state: state.clone(),
+        reactor: Rc::new(RefCell::new(Reactor::new())),
+        wheel: Rc::new(TimerHeap::new()),
+        job_tx: pool.job_tx(),
+    });
 
-    let fut = crate::blocking::spawn_blocking(|| {
+    let fut = crate::task::blocking::spawn_blocking(|| {
         thread::sleep(Duration::from_millis(50));
         7u32
     });
@@ -312,12 +312,12 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
     let waker = create_waker(state.clone(), id);
     let mut cx = Context::from_waker(&waker);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
-    assert!(state.borrow().blocking.contains_key(&id));
+    assert!(state.borrow().blocking_wakers.contains_key(&id));
 
     drop(fut);
-    assert!(state.borrow().blocking.is_empty());
+    assert!(state.borrow().blocking_wakers.is_empty());
 
-    blocking::uninstall();
+    context::uninstall();
 }
 
 // Step 15 — shutdown: `run()` drops the Mar when it returns, which closes
@@ -328,7 +328,7 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
 fn runtime_drop_joins_workers_promptly_after_run() {
     let start = Instant::now();
     Mar::run(async {
-        let _ = crate::blocking::spawn_blocking(|| 21 * 2).await;
+        let _ = crate::task::blocking::spawn_blocking(|| 21 * 2).await;
     })
     .expect("run should not fail");
     assert!(start.elapsed() < Duration::from_millis(500));

@@ -1,12 +1,12 @@
 use std::time::Duration;
 
 use mar::Mar;
-use mar::blocking::spawn_blocking;
-use mar::timer_wheel::sleep;
+use mar::task::spawn_blocking;
+use mar::time::sleep;
 
 // A job that may fail (here: the first two attempts fail, then it succeeds),
 // retried with exponential backoff. Each attempt runs on the worker pool; the
-// backoff wait parks the executor on the timer wheel between attempts.
+// backoff wait parks the executor on the timer heap between attempts.
 fn main() {
     Mar::run(async move {
         let mut attempt = 0;

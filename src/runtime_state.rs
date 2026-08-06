@@ -9,7 +9,8 @@ pub struct RuntimeState {
     pub queue: VecDeque<usize>,
     pub tasks: HashMap<usize, Task>,
     pub next_id: usize,
-    pub blocking: HashMap<usize, Waker>,
+    pub blocking_wakers: HashMap<usize, Waker>,
+    pub(crate) next_blocking_id: usize,
 }
 
 impl RuntimeState {
@@ -18,7 +19,8 @@ impl RuntimeState {
             queue: VecDeque::new(),
             tasks: HashMap::new(),
             next_id: 0,
-            blocking: HashMap::new(),
+            blocking_wakers: HashMap::new(),
+            next_blocking_id: 0,
         }))
     }
 }

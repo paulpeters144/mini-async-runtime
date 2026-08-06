@@ -73,9 +73,9 @@ The golden rule of this runtime: **a future that returns `Pending` must ensure
 its waker will eventually be woken** — otherwise the task is lost and the loop
 can never terminate. Each component that parks a task stores a waker somewhere:
 
-- `Sleep` stores it in the future and re-polls itself when the wheel expires it;
-- `Readable`/`Writable` store it in the reactor's token→waker registry;
-- `BlockingTask` stores it in `RuntimeState::blocking`;
+- `Sleep` stores it in the timer heap via `TimerHeap::push`;
+- `ReadFuture`/`WriteFuture` store it in the reactor's token→waker registry;
+- `BlockingTask` stores it in `RuntimeState::blocking_wakers`;
 - `yield_now` and any self-waking future call `wake_by_ref()` immediately.
 
 ## Key tests to read

@@ -56,7 +56,8 @@ impl WorkerPool {
     /// Send a closure to a worker thread. The closure runs once and its result
     /// is discarded — the caller should arrange its own back-channel for the
     /// return value (typically an `mpsc::channel` inside `spawn_blocking`).
-    pub fn submit(&self, job: Job) {
+    #[allow(dead_code)]
+    pub(crate) fn submit(&self, job: Job) {
         self.job_tx
             .as_ref()
             .expect("worker pool shut down")

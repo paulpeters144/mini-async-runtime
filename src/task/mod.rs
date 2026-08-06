@@ -1,3 +1,7 @@
+pub mod blocking;
+pub mod yield_now;
+pub(crate) mod worker_pool;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -24,6 +28,9 @@ impl Task {
         self.future.as_mut().poll(cx)
     }
 }
+
+pub use blocking::spawn_blocking;
+pub use yield_now::yield_now;
 
 // A `Task` is the unit of work the executor owns: an id the waker uses to
 // reach it, plus the future itself. They check the two promises a task makes
@@ -59,7 +66,7 @@ fn new_wraps_future_with_id() {
     // A `Task` holds only an id and the future. The future is a trait object
     // behind a `Box`, and a trait object is a *fat* pointer: a data pointer
     // plus a vtable pointer. So the size adds up as:
-    let word = size_of::<usize>();
+    let word = std::mem::size_of::<usize>();
     let data_ptr = word; // the Box's pointer to the heap allocation
     let vtable_ptr = word; // the vtable needed to call `Future::poll`
     let id = word; // the task's id

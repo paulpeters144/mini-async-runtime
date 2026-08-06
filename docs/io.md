@@ -6,11 +6,11 @@ Source: [`src/io.rs`](../src/io.rs)
 the executor thread: `io::read` and `io::write`. They are the primary consumers
 of the reactor (see [reactor.md](reactor.md)).
 
-## `Readable` — `io::read(src)`
+## `ReadFuture` — `io::read(src)`
 
 `io::read(src)` takes ownership of a `mio::event::Source` (e.g. a
 `mio::net::TcpStream`) and returns a future that reads bytes from it once. It is
-the I/O analogue of `timer_wheel::sleep`: a free function that reaches the
+the I/O analogue of `time::sleep`: a free function that reaches the
 shared reactor through the thread-local handle installed by `run()`.
 
 The poll logic, step by step:
@@ -32,12 +32,12 @@ re-queues the task. The next poll succeeds at step 2 and completes.
 
 ### Cancellation
 
-If a `Readable` is dropped before completing, its `Drop` impl deregisters the
+If a `ReadFuture` is dropped before completing, its `Drop` impl deregisters the
 source from the poller *and* removes the waker from the reactor's registry.
 This is the same cancellation discipline as `Sleep` in the timer wheel: a stale
 registration would otherwise block the termination check forever.
 
-## `Writable` — `io::write(src, buf)`
+## `WriteFuture` — `io::write(src, buf)`
 
 `io::write(src, buf)` writes a whole buffer to a source, returning when every
 byte has been accepted. Writes are trickier than reads because the OS may
@@ -52,7 +52,7 @@ accept only *part* of a buffer before blocking:
 
 The 1 MiB test in `io.rs` (`writable_partial_write_stores_waker`) is what
 exercises this: a large payload overflows the socket's send buffer, forcing a
-partial write and a parked `Writable` whose waker must be stored.
+partial write and a parked `WriteFuture` whose waker must be stored.
 
 ## Why one-shot?
 
@@ -72,8 +72,8 @@ reply over another — each socket sees exactly one operation.
 | Read/write succeeds | `deregister_source(src, token)` — remove fd + waker |
 | Dropped mid-flight | `deregister_source(src, token)` — same cleanup, from `Drop` |
 
-All of these go through `reactor::with(|r| …)`, which borrows the shared
-reactor for the duration of the call.
+All of these go through `context::with(|ctx| …)`, which provides access to the
+shared reactor via the single thread-local context.
 
 ## Key tests to read
 
@@ -86,4 +86,4 @@ reactor for the duration of the call.
 - `readable_and_writable_coexist_on_separate_pairs` — two active registrations
   at once, proving the token allocator prevents collisions.
 - `writable_partial_write_stores_waker` — the partial-write case that forces a
-  parked `Writable`.
+  parked `WriteFuture`.

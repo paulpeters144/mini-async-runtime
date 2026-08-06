@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use mar::Mar;
-use mar::blocking::spawn_blocking;
+use mar::task::spawn_blocking;
 use mar::io;
 
 // A "server" whose handler is one root future: accept two connections, read a

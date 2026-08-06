@@ -1,4 +1,4 @@
-use crate::reactor;
+use crate::context;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::pin::Pin;
@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 // bytes read. If the future is dropped before it completes, `Drop` deregisters
 // so the source does not leave a stale entry blocking the termination check
 // (the same cancellation discipline as `Sleep`).
-pub struct Readable<T: mio::event::Source> {
+pub struct ReadFuture<T: mio::event::Source> {
     src: Option<T>,
     token: mio::Token,
     registered: bool,
@@ -23,12 +23,12 @@ pub struct Readable<T: mio::event::Source> {
 
 /// Build a future that reads bytes from the given source.
 ///
-/// Mirrors `timer_wheel::sleep`: a free function that reaches the shared
+/// Mirrors `time::sleep`: a free function that reaches the shared
 /// reactor through the thread-local handle installed by `run()`. Calling it
 /// outside `run()` panics with a clear message.
-pub fn read<T: mio::event::Source>(src: T) -> Readable<T> {
-    let token = reactor::with(|reactor| reactor.allocate_token());
-    Readable {
+pub fn read<T: mio::event::Source>(src: T) -> ReadFuture<T> {
+    let token = context::with(|ctx| ctx.reactor.borrow_mut().allocate_token());
+    ReadFuture {
         src: Some(src),
         token,
         registered: false,
@@ -36,7 +36,7 @@ pub fn read<T: mio::event::Source>(src: T) -> Readable<T> {
     }
 }
 
-impl<T: Read + mio::event::Source + Unpin> Future for Readable<T> {
+impl<T: Read + mio::event::Source + Unpin> Future for ReadFuture<T> {
     type Output = Vec<u8>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -45,26 +45,26 @@ impl<T: Read + mio::event::Source + Unpin> Future for Readable<T> {
             return Poll::Ready(Vec::new());
         }
 
-        let src = this.src.as_mut().expect("Readable polled after completion");
+        let src = this.src.as_mut().expect("ReadFuture polled after completion");
         let mut buf = [0u8; 64];
         match src.read(&mut buf) {
             Ok(n) => {
-                reactor::with(|reactor| {
-                    let _ = reactor.deregister_source(src, this.token);
+                context::with(|ctx| {
+                    let _ = ctx.reactor.borrow_mut().deregister_source(src, this.token);
                 });
                 this.done = true;
                 Poll::Ready(buf[..n].to_vec())
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 if !this.registered {
-                    reactor::with(|reactor| {
-                        reactor
+                    context::with(|ctx| {
+                        ctx.reactor.borrow_mut()
                             .register_source(src, this.token, mio::Interest::READABLE)
                             .unwrap();
                     });
                     this.registered = true;
                 }
-                reactor::with(|reactor| reactor.register(this.token, cx.waker().clone()));
+                context::with(|ctx| ctx.reactor.borrow_mut().register(this.token, cx.waker().clone()));
                 Poll::Pending
             }
             Err(e) => panic!("read failed: {e}"),
@@ -72,11 +72,11 @@ impl<T: Read + mio::event::Source + Unpin> Future for Readable<T> {
     }
 }
 
-impl<T: mio::event::Source> Drop for Readable<T> {
+impl<T: mio::event::Source> Drop for ReadFuture<T> {
     fn drop(&mut self) {
         if let Some(src) = self.src.as_mut() && !self.done {
-            reactor::with(|reactor| {
-                let _ = reactor.deregister_source(src, self.token);
+            context::with(|ctx| {
+                let _ = ctx.reactor.borrow_mut().deregister_source(src, self.token);
             });
         }
     }
@@ -89,7 +89,7 @@ impl<T: mio::event::Source> Drop for Readable<T> {
 // the socket can accept more bytes. A single poll may only write part of the
 // buffer, so the future tracks where it left off and resumes from there on the
 // next poll. When the whole buffer is flushed it deregisters and completes.
-pub struct Writable<T: mio::event::Source> {
+pub struct WriteFuture<T: mio::event::Source> {
     src: Option<T>,
     token: mio::Token,
     registered: bool,
@@ -99,9 +99,9 @@ pub struct Writable<T: mio::event::Source> {
 }
 
 /// Build a future that writes `buf` (its contents are copied) to the source.
-pub fn write<T: mio::event::Source>(src: T, buf: Vec<u8>) -> Writable<T> {
-    let token = reactor::with(|reactor| reactor.allocate_token());
-    Writable {
+pub fn write<T: mio::event::Source>(src: T, buf: Vec<u8>) -> WriteFuture<T> {
+    let token = context::with(|ctx| ctx.reactor.borrow_mut().allocate_token());
+    WriteFuture {
         src: Some(src),
         token,
         registered: false,
@@ -111,7 +111,7 @@ pub fn write<T: mio::event::Source>(src: T, buf: Vec<u8>) -> Writable<T> {
     }
 }
 
-impl<T: Write + mio::event::Source + Unpin> Future for Writable<T> {
+impl<T: Write + mio::event::Source + Unpin> Future for WriteFuture<T> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -120,39 +120,39 @@ impl<T: Write + mio::event::Source + Unpin> Future for Writable<T> {
             return Poll::Ready(());
         }
 
-        let src = this.src.as_mut().expect("Writable polled after completion");
+        let src = this.src.as_mut().expect("WriteFuture polled after completion");
         match src.write(&this.buf[this.offset..]) {
             Ok(n) => {
                 this.offset += n;
                 if this.offset == this.buf.len() {
-                    reactor::with(|reactor| {
-                        let _ = reactor.deregister_source(src, this.token);
+                    context::with(|ctx| {
+                        let _ = ctx.reactor.borrow_mut().deregister_source(src, this.token);
                     });
                     this.done = true;
                     Poll::Ready(())
                 } else {
                     if !this.registered {
-                        reactor::with(|reactor| {
-                            reactor
+                        context::with(|ctx| {
+                            ctx.reactor.borrow_mut()
                                 .register_source(src, this.token, mio::Interest::WRITABLE)
                                 .unwrap();
                         });
                         this.registered = true;
                     }
-                    reactor::with(|reactor| reactor.register(this.token, cx.waker().clone()));
+                    context::with(|ctx| ctx.reactor.borrow_mut().register(this.token, cx.waker().clone()));
                     Poll::Pending
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 if !this.registered {
-                    reactor::with(|reactor| {
-                        reactor
+                    context::with(|ctx| {
+                        ctx.reactor.borrow_mut()
                             .register_source(src, this.token, mio::Interest::WRITABLE)
                             .unwrap();
                     });
                     this.registered = true;
                 }
-                reactor::with(|reactor| reactor.register(this.token, cx.waker().clone()));
+                context::with(|ctx| ctx.reactor.borrow_mut().register(this.token, cx.waker().clone()));
                 Poll::Pending
             }
             Err(e) => panic!("write failed: {e}"),
@@ -160,11 +160,11 @@ impl<T: Write + mio::event::Source + Unpin> Future for Writable<T> {
     }
 }
 
-impl<T: mio::event::Source> Drop for Writable<T> {
+impl<T: mio::event::Source> Drop for WriteFuture<T> {
     fn drop(&mut self) {
         if let Some(src) = self.src.as_mut() && !self.done {
-            reactor::with(|reactor| {
-                let _ = reactor.deregister_source(src, self.token);
+            context::with(|ctx| {
+                let _ = ctx.reactor.borrow_mut().deregister_source(src, self.token);
             });
         }
     }
@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(result.borrow().as_slice(), b"hello");
     }
 
-    // If a `Readable` completes before a `read` is ever awaited, the source is
+    // If a `ReadFuture` completes before a `read` is ever awaited, the source is
     // deregistered and reclaimed, and `run()` can return with an empty reactor.
     // This proves an already-readable socket does not leak a registration.
     #[test]
@@ -216,10 +216,10 @@ mod tests {
         assert!(got.get());
     }
 
-    // `Writable` works in isolation: the writer flushes its buffer into the tx
+    // `WriteFuture` works in isolation: the writer flushes its buffer into the tx
     // end of a socket pair, and the bytes show up on the rx end (read with a
     // plain non-async `read`). Small writes complete on the first poll without
-    // ever registering with the reactor — `Writable` returns `Ready` immediately.
+    // ever registering with the reactor — `WriteFuture` returns `Ready` immediately.
     #[test]
     fn writable_flushes_bytes_to_pair() {
         let (tx, mut rx) = mio::net::UnixStream::pair().unwrap();
@@ -236,7 +236,7 @@ mod tests {
 
     // Two independent socket pairs active at once: data is written before
     // `run()`, then both reads complete sequentially in one root future. The
-    // token allocator hands out distinct tokens so the two `Readable` futures
+    // token allocator hands out distinct tokens so the two `ReadFuture` futures
     // do not collide on the shared poller.
     #[test]
     fn readable_and_writable_coexist_on_separate_pairs() {
@@ -266,11 +266,15 @@ mod tests {
     // frees up.
     #[test]
     fn writable_partial_write_stores_waker() {
-        use crate::reactor;
         use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-        let runtime = Mar::new();
-        reactor::install(runtime.reactor.clone());
+        let reactor = Rc::new(RefCell::new(crate::reactor::Reactor::new()));
+        crate::context::install(crate::context::ContextHandle {
+            state: crate::runtime_state::RuntimeState::new(),
+            reactor: reactor.clone(),
+            wheel: Rc::new(crate::time::TimerHeap::new()),
+            job_tx: std::sync::mpsc::channel::<crate::task::worker_pool::Job>().0,
+        });
 
         let (tx, _rx) = mio::net::UnixStream::pair().unwrap();
         let payload = vec![0xAB_u8; 1024 * 1024];
@@ -284,6 +288,6 @@ mod tests {
 
         let result = fut.as_mut().poll(&mut cx);
         assert_eq!(result, Poll::Pending);
-        assert!(!runtime.reactor.borrow().is_empty(), "waker was not stored");
+        assert!(!reactor.borrow().is_empty(), "waker was not stored");
     }
 }

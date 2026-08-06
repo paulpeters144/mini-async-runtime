@@ -71,11 +71,11 @@ a token from any thread.
 
 ## Thread-local access
 
-Like the timer wheel, the reactor is installed into a thread-local by
-`Mar::run`. I/O futures reach it through `reactor::with(|r| …)`, a free
-function that hands a `&mut Reactor` to the closure. This is why `io::read()`
-and `io::write()` are plain functions with no explicit handle — and why calling
-them outside `run()` panics.
+The reactor is accessible through the single thread-local `ContextHandle`
+installed by `Mar::run`. I/O futures reach it through `context::with(|ctx| …)`,
+which provides access to all runtime internals including the reactor. This is
+why `io::read()` and `io::write()` are plain functions with no explicit
+handle — and why calling them outside `run()` panics.
 
 ## Key tests to read
 

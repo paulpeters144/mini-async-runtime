@@ -89,28 +89,6 @@ impl Default for Reactor {
     }
 }
 
-thread_local! {
-    static HANDLE: RefCell<Option<ReactorHandle>> = const { RefCell::new(None) };
-}
-
-pub(crate) fn install(handle: ReactorHandle) {
-    HANDLE.with(|h| *h.borrow_mut() = Some(handle));
-}
-
-// Free-function access to the reactor installed by `install()`: a future that
-// does not want to carry its own `ReactorHandle` reaches the shared reactor
-// through this. The I/O wrapper futures (`io::read` / `io::write`, the
-// analogue of `Sleep`'s free `sleep()`) are its consumers.
-pub(crate) fn with<R>(f: impl FnOnce(&mut Reactor) -> R) -> R {
-    HANDLE.with(|h| {
-        f(&mut h
-            .borrow_mut()
-            .as_mut()
-            .expect("reactor not installed")
-            .borrow_mut())
-    })
-}
-
 pub fn dispatch(handle: &ReactorHandle, events: &mio::Events) {
     let reactor = handle.borrow_mut();
     for event in events.iter() {

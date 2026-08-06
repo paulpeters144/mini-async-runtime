@@ -1,6 +1,6 @@
 # Tasks (`mar::task`)
 
-Source: [`src/task.rs`](../src/task.rs)
+Source: [`src/task/`](../src/task/)
 
 A `Task` is the unit of work the executor owns: one future, tagged with an id so
 a waker can reach it.
@@ -18,6 +18,20 @@ It makes exactly two promises to the executor:
 2. **I remember where I left off** — because the future is *pinned*, resuming
    after a `Pending` is safe: any self-references inside the future's state
    machine are still valid.
+
+## The `task` module layout
+
+```
+src/task/
+  mod.rs          — Task struct + subsystem docs + re-exports
+  yield_now.rs    — YieldNow + yield_now()
+  blocking.rs     — BlockingTask + spawn_blocking
+  worker_pool.rs  — WorkerPool + Job
+```
+
+The public API is:
+- `mar::task::spawn_blocking` — offload work to a worker thread
+- `mar::task::yield_now` — voluntarily yield to the executor
 
 ## Why `Box::pin`?
 
@@ -57,7 +71,7 @@ with the outside world through shared state like `Rc<Cell<_>>`).
 ## Why the future is a trait object
 
 `dyn Future<Output = ()>` lets a single `Task` type hold *any* future — your
-root `async` block, a `Sleep`, a `Readable`, a `BlockingTask` — all behind one
+root `async` block, a `Sleep`, a `ReadFuture`, a `BlockingTask` — all behind one
 pointer. The `+ 'static` bound means a task never borrows from the stack; it
 owns everything it needs to run to completion on its own.
 

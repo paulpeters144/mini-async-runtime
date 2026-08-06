@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mar::Mar;
-use mar::blocking::spawn_blocking;
-use mar::timer_wheel::sleep;
+use mar::task::spawn_blocking;
+use mar::time::sleep;
 
 // A long-running blocking job and a progress indicator that run in parallel.
 // `spawn_blocking` sends the closure to a worker thread EAGERLY, so the job

@@ -1,5 +1,5 @@
 use mar::Mar;
-use mar::blocking::spawn_blocking;
+use mar::task::spawn_blocking;
 
 // The whole program is a single future passed to `Mar::run()`: fetch the
 // body, write it to examples/get-data.json, read it back, and print it. The
@@ -41,4 +41,3 @@ fn main() {
     })
     .expect("run failed");
 }
-
