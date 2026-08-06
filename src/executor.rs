@@ -25,13 +25,11 @@ impl Runtime {
         let state = RuntimeState::new();
         let wheel = Rc::new(RefCell::new(std::collections::BinaryHeap::new()));
         let reactor = Rc::new(RefCell::new(Reactor::new()));
-        let waker = {
+        let pool = {
             let reactor_ref = reactor.borrow();
-            let reg =reactor_ref.registry();
-            let mio_waker = mio::Waker::new(reg, WAKEN_TOKEN);
-            Arc::new(mio_waker.unwrap())
+            let waker = Arc::new(mio::Waker::new(reactor_ref.registry(), WAKEN_TOKEN).unwrap());
+            WorkerPool::new(waker)
         };
-        let pool = WorkerPool::new(waker.clone());
         let events = mio::Events::with_capacity(64);
         Runtime {
             state,
