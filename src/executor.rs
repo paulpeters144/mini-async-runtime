@@ -17,7 +17,6 @@ pub struct Runtime {
     wheel: TimerWheel,
     pub(crate) reactor: ReactorHandle,
     pool: WorkerPool,
-    _waker: Arc<mio::Waker>,
     events: mio::Events,
 }
 
@@ -28,7 +27,9 @@ impl Runtime {
         let reactor = Rc::new(RefCell::new(Reactor::new()));
         let waker = {
             let reactor_ref = reactor.borrow();
-            Arc::new(mio::Waker::new(reactor_ref.registry(), WAKEN_TOKEN).unwrap())
+            let reg =reactor_ref.registry();
+            let mio_waker = mio::Waker::new(reg, WAKEN_TOKEN);
+            Arc::new(mio_waker.unwrap())
         };
         let pool = WorkerPool::new(waker.clone());
         let events = mio::Events::with_capacity(64);
@@ -37,7 +38,6 @@ impl Runtime {
             wheel,
             reactor,
             pool,
-            _waker: waker,
             events,
         }
     }
