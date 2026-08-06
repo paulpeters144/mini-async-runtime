@@ -1,0 +1,21 @@
+[package]
+name = "rrest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+http = "1"
+httparse = "1"
+url = "2"
+
+# Optional TLS
+rustls = { version = "0.23", optional = true }
+rustls-pki-types = { version = "1", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+[features]
+default = []
+tls = ["rustls", "rustls-pki-types", "webpki-roots"]
+
+[dev-dependencies]
+pollster = "0.4"
