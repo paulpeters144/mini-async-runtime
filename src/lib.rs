@@ -1,5 +1,4 @@
 pub mod context;
-pub mod io;
 pub mod mar;
 pub mod reactor;
 pub mod runtime_state;

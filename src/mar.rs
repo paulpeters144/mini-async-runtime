@@ -235,34 +235,6 @@ fn probe_future_re_polls_until_ready() {
     assert_eq!(polls.get(), 3);
 }
 
-// A task parked on a socket: the I/O analogue of `Sleep`, now provided by the
-// public `io::read` future. On its first `WouldBlock` poll it reaches the
-    // shared reactor through the thread-local `context::with` accessor, registering
-// the read end with the poller and storing its waker under a token allocated by
-// the reactor; returning `Pending` makes the executor park the thread. A write
-// on the other end of the socket pair — from another thread — fires the
-// readiness event; `dispatch` calls the stored waker, which re-queues the task;
-// the next poll finds the bytes, deregisters, and completes. The task is then
-// dropped, the reactor empties, and `run()` can return. The whole reactor in
-// one `run()` call.
-#[test]
-fn run_wakes_a_task_parked_on_io_readiness() {
-    let (tx, rx) = mio::net::UnixStream::pair().unwrap();
-
-    let writer = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(20));
-        let mut tx = tx;
-        tx.write_all(b"x").unwrap();
-    });
-
-    Mar::run(async move {
-        let _ = crate::io::read(rx).await;
-    })
-    .expect("run should not fail");
-
-    writer.join().unwrap();
-}
-
 // Smoke test: spawn_blocking called and awaited inside run().
 #[test]
 fn spawn_blocking_smoke() {
