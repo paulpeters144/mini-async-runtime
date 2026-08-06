@@ -16,10 +16,10 @@ impl fmt::Debug for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::InvalidUrl(msg) => write!(f, "invalid URL: {msg}"),
-            Error::Http(status) => write!(f, "HTTP {status}"),
-            Error::Protocol(msg) => write!(f, "protocol error: {msg}"),
-            Error::Io(e) => write!(f, "I/O error: {e}"),
+            Self::InvalidUrl(msg) => write!(f, "invalid URL: {msg}"),
+            Self::Http(status) => write!(f, "HTTP {status}"),
+            Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
         }
     }
 }
@@ -28,6 +28,6 @@ impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
+        Self::Io(e)
     }
 }

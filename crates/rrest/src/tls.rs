@@ -35,7 +35,7 @@ mod tls_impl {
             let tls = rustls::ClientConnection::new(Arc::new(config), server_name)
                 .map_err(|e| Error::Io(io::Error::other(format!("failed to create TLS connection: {e}"))))?;
 
-            let mut stream = TlsStream {
+            let mut stream = Self {
                 inner,
                 tls,
                 send_buf: Vec::new(),

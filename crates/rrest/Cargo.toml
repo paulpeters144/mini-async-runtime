@@ -14,7 +14,7 @@ rustls-pki-types = { version = "1", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 
 [features]
-default = []
+default = ["tls"]
 tls = ["rustls", "rustls-pki-types", "webpki-roots"]
 
 [dev-dependencies]

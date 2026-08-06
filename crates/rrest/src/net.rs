@@ -47,12 +47,19 @@ impl Connection for TcpConnection {
     }
 }
 
-pub async fn connect(url: &str) -> Result<Box<dyn Connection>, Error> {
+/// Opens a TCP connection to the host:port parsed from the URL.
+///
+/// # Errors
+///
+/// Returns an error if the URL is invalid, has no host, or the TCP connection fails.
+pub fn connect(url: &str) -> Result<Box<dyn Connection>, Error> {
     let parsed = url::Url::parse(url).map_err(|e| Error::InvalidUrl(e.to_string()))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| Error::InvalidUrl("missing host".into()))?;
-    let port = parsed.port().unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+    let port = parsed
+        .port()
+        .unwrap_or_else(|| if parsed.scheme() == "https" { 443 } else { 80 });
     let addr = format!("{host}:{port}");
 
     let stream = TcpStream::connect(&addr).map_err(Error::Io)?;

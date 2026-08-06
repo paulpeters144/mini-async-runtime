@@ -29,7 +29,6 @@ pub fn parse_response(buf: &[u8]) -> Result<ParsedResponse, Error> {
     .map_err(|_| Error::Protocol("invalid status code".into()))?;
 
     let version = match resp.version {
-        Some(1) => Version::HTTP_11,
         Some(0) => Version::HTTP_10,
         _ => Version::HTTP_11,
     };
