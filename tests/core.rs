@@ -12,8 +12,6 @@ use mar::timer_wheel::sleep;
 // wall time is the max (~200ms), not the sum (250ms).
 #[test]
 fn spawn_blocking_interleaves_with_timer() {
-    let mut runtime = Runtime::new();
-
     let blocking_done = Rc::new(Cell::new(false));
     let timer_fired = Rc::new(Cell::new(false));
 
@@ -22,23 +20,22 @@ fn spawn_blocking_interleaves_with_timer() {
     {
         let blocking_done = blocking_done.clone();
         let timer_fired = timer_fired.clone();
-        runtime
-            .run(async move {
-                let blocking = spawn_blocking(|| {
-                    std::thread::sleep(Duration::from_millis(200));
-                    42u32
-                });
+        Runtime::run(async move {
+            let blocking = spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                42u32
+            });
 
-                // Worker is already running the 200ms closure. Park on the
-                // timer wheel for 50ms while the worker keeps ticking.
-                sleep(Duration::from_millis(50)).await;
-                timer_fired.set(true);
+            // Worker is already running the 200ms closure. Park on the
+            // timer wheel for 50ms while the worker keeps ticking.
+            sleep(Duration::from_millis(50)).await;
+            timer_fired.set(true);
 
-                let result = blocking.await;
-                assert_eq!(result, 42);
-                blocking_done.set(true);
-            })
-            .expect("run should not fail");
+            let result = blocking.await;
+            assert_eq!(result, 42);
+            blocking_done.set(true);
+        })
+        .expect("run should not fail");
     }
 
     let elapsed = start.elapsed();
@@ -54,16 +51,14 @@ fn spawn_blocking_interleaves_with_timer() {
 // boundary.
 #[test]
 fn spawn_blocking_round_trip_value() {
-    let mut runtime = Runtime::new();
     let got = Rc::new(RefCell::new(String::new()));
     {
         let got = got.clone();
-        runtime
-            .run(async move {
-                let result = spawn_blocking(|| "hello worker".to_string()).await;
-                *got.borrow_mut() = result;
-            })
-            .expect("run should not fail");
+        Runtime::run(async move {
+            let result = spawn_blocking(|| "hello worker".to_string()).await;
+            *got.borrow_mut() = result;
+        })
+        .expect("run should not fail");
     }
 
     assert_eq!(got.borrow().as_str(), "hello worker");
@@ -74,21 +69,19 @@ fn spawn_blocking_round_trip_value() {
 // both results cross back.
 #[test]
 fn two_spawn_blockings_both_complete() {
-    let mut runtime = Runtime::new();
     let completed = Rc::new(Cell::new(0usize));
     {
         let completed = completed.clone();
-        runtime
-            .run(async move {
-                let result = spawn_blocking(move || 0u32).await;
-                assert_eq!(result, 0);
-                completed.set(completed.get() + 1);
+        Runtime::run(async move {
+            let result = spawn_blocking(move || 0u32).await;
+            assert_eq!(result, 0);
+            completed.set(completed.get() + 1);
 
-                let result = spawn_blocking(move || 10u32).await;
-                assert_eq!(result, 10);
-                completed.set(completed.get() + 1);
-            })
-            .expect("run should not fail");
+            let result = spawn_blocking(move || 10u32).await;
+            assert_eq!(result, 10);
+            completed.set(completed.get() + 1);
+        })
+        .expect("run should not fail");
     }
 
     assert_eq!(completed.get(), 2);
@@ -100,8 +93,7 @@ fn two_spawn_blockings_both_complete() {
 #[test]
 #[should_panic(expected = "blocking closure exploded")]
 fn panicking_blocking_closure_makes_run_panic() {
-    let mut runtime = Runtime::new();
-    let _ = runtime.run(async {
+    let _ = Runtime::run(async {
         let _ = spawn_blocking(|| -> () {
             panic!("blocking closure exploded");
         })

@@ -275,16 +275,14 @@ mod tests {
     // into the executor correctly.
     #[test]
     fn sleep_zero_completes_in_runtime() {
-        let mut runtime = Runtime::new();
         let flag = Rc::new(Cell::new(false));
         {
             let flag = flag.clone();
-            runtime
-                .run(async move {
-                    sleep(Duration::ZERO).await;
-                    flag.set(true);
-                })
-                .expect("run should not fail");
+            Runtime::run(async move {
+                sleep(Duration::ZERO).await;
+                flag.set(true);
+            })
+            .expect("run should not fail");
         }
         assert!(flag.get());
     }
@@ -296,16 +294,14 @@ mod tests {
     // proves the task was polled twice (first to suspend, second to complete).
     #[test]
     fn yield_now_returns_pending_then_ready() {
-        let mut runtime = Runtime::new();
         let flag = Rc::new(Cell::new(false));
         {
             let flag = flag.clone();
-            runtime
-                .run(async move {
-                    yield_now().await;
-                    flag.set(true);
-                })
-                .expect("run should not fail");
+            Runtime::run(async move {
+                yield_now().await;
+                flag.set(true);
+            })
+            .expect("run should not fail");
         }
         assert!(flag.get());
     }

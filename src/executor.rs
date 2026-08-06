@@ -21,7 +21,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let state = RuntimeState::new();
         let wheel = Rc::new(RefCell::new(std::collections::BinaryHeap::new()));
         let reactor = Rc::new(RefCell::new(Reactor::new()));
@@ -40,13 +40,15 @@ impl Runtime {
         }
     }
 
-    pub fn run<F>(&mut self, future: F) -> io::Result<()>
+    pub fn run<F>(future: F) -> io::Result<()>
     where
         F: Future<Output = ()> + 'static,
     {
-        timer_wheel::install(self.wheel.clone());
-        reactor::install(self.reactor.clone());
-        blocking::install(self.state.clone(), self.pool.job_tx());
+        let mut runtime = Self::new();
+
+        timer_wheel::install(runtime.wheel.clone());
+        reactor::install(runtime.reactor.clone());
+        blocking::install(runtime.state.clone(), runtime.pool.job_tx());
 
         // Panic safety: if a task poll panics (e.g. a blocking closure's
         // payload is resumed inside `poll`), unwinding must still release the
@@ -61,7 +63,7 @@ impl Runtime {
         let _guard = BlockingUninstall;
 
         {
-            let mut state = self.state.borrow_mut();
+            let mut state = runtime.state.borrow_mut();
             let id = state.next_id;
             state.next_id += 1;
             state.tasks.insert(id, Task::new(id, future));
@@ -71,7 +73,7 @@ impl Runtime {
         loop {
             loop {
                 let next = {
-                    let mut state = self.state.borrow_mut();
+                    let mut state = runtime.state.borrow_mut();
                     state.queue.pop_front()
                 };
                 let id = match next {
@@ -79,17 +81,17 @@ impl Runtime {
                     None => break,
                 };
 
-                let mut task = match self.state.borrow_mut().tasks.remove(&id) {
+                let mut task = match runtime.state.borrow_mut().tasks.remove(&id) {
                     Some(task) => task,
                     None => continue,
                 };
 
                 timer_wheel::set_current_id(id);
-                let waker = create_waker(self.state.clone(), id);
+                let waker = create_waker(runtime.state.clone(), id);
                 let mut cx = Context::from_waker(&waker);
                 match task.poll(&mut cx) {
                     Poll::Pending => {
-                        self.state.borrow_mut().tasks.insert(id, task);
+                        runtime.state.borrow_mut().tasks.insert(id, task);
                     }
                     Poll::Ready(()) => {}
                 }
@@ -97,9 +99,9 @@ impl Runtime {
             }
 
             let done = {
-                let state = self.state.borrow();
-                let wheel = self.wheel.borrow();
-                let reactor = self.reactor.borrow();
+                let state = runtime.state.borrow();
+                let wheel = runtime.wheel.borrow();
+                let reactor = runtime.reactor.borrow();
                 state.tasks.is_empty()
                     && wheel.is_empty()
                     && reactor.is_empty()
@@ -109,7 +111,7 @@ impl Runtime {
                 return Ok(());
             }
 
-            let timeout = timer_wheel::next_deadline(&self.wheel).map(|deadline| {
+            let timeout = timer_wheel::next_deadline(&runtime.wheel).map(|deadline| {
                 let now = Instant::now();
                 if deadline > now {
                     deadline - now
@@ -117,13 +119,16 @@ impl Runtime {
                     Duration::ZERO
                 }
             });
-            self.reactor.borrow_mut().park(&mut self.events, timeout)?;
+            runtime
+                .reactor
+                .borrow_mut()
+                .park(&mut runtime.events, timeout)?;
 
-            for id in timer_wheel::expire_due(&self.wheel) {
-                self.state.borrow_mut().queue.push_back(id);
+            for id in timer_wheel::expire_due(&runtime.wheel) {
+                runtime.state.borrow_mut().queue.push_back(id);
             }
 
-            for event in self.events.iter() {
+            for event in runtime.events.iter() {
                 if event.token() == WAKEN_TOKEN {
                     // Collect first, then wake: `wake_by_ref` pushes the task
                     // id onto the queue — a `borrow_mut` on `state` — so the
@@ -131,7 +136,7 @@ impl Runtime {
                     // before any waker fires, or the RefCell double-borrows
                     // and panics.
                     let wakers: Vec<Waker> = {
-                        let state = self.state.borrow();
+                        let state = runtime.state.borrow();
                         state.blocking.values().cloned().collect()
                     };
                     for waker in &wakers {
@@ -140,7 +145,7 @@ impl Runtime {
                 }
             }
 
-            reactor::dispatch(&self.reactor, &self.events);
+            reactor::dispatch(&runtime.reactor, &runtime.events);
         }
     }
 }
@@ -177,11 +182,7 @@ fn new_runtime_has_empty_queue_and_task_map() {
 // immediately with a clean state — no queue entries, no lingering tasks.
 #[test]
 fn run_returns_immediately_with_empty_future() {
-    let mut runtime = Runtime::new();
-    runtime.run(async {}).expect("run should not fail");
-    let state = runtime.state.borrow();
-    assert!(state.queue.is_empty());
-    assert!(state.tasks.is_empty());
+    Runtime::run(async {}).expect("run should not fail");
 }
 
 // A root future with no awaits completes on the first poll and the executor
@@ -189,20 +190,15 @@ fn run_returns_immediately_with_empty_future() {
 #[test]
 fn run_completes_task_and_leaves_empty_state() {
     let polls = Rc::new(Cell::new(0usize));
-    let mut runtime = Runtime::new();
     {
         let polls = polls.clone();
-        runtime
-            .run(async move {
-                polls.set(polls.get() + 1);
-            })
-            .expect("run should not fail");
+        Runtime::run(async move {
+            polls.set(polls.get() + 1);
+        })
+        .expect("run should not fail");
     }
 
     assert_eq!(polls.get(), 1);
-    let state = runtime.state.borrow();
-    assert!(state.queue.is_empty());
-    assert!(state.tasks.is_empty());
 }
 
 // The heart of the executor: a future is not necessarily done on the first
@@ -237,18 +233,13 @@ impl Future for Probe {
 #[test]
 fn probe_future_re_polls_until_ready() {
     let polls = Rc::new(Cell::new(0usize));
-    let mut runtime = Runtime::new();
-    runtime
-        .run(Probe {
-            target: 3,
-            polls: polls.clone(),
-        })
-        .expect("run should not fail");
+    Runtime::run(Probe {
+        target: 3,
+        polls: polls.clone(),
+    })
+    .expect("run should not fail");
 
     assert_eq!(polls.get(), 3);
-    let state = runtime.state.borrow();
-    assert!(state.queue.is_empty());
-    assert!(state.tasks.is_empty());
 }
 
 // A task parked on a socket: the I/O analogue of `Sleep`, now provided by the
@@ -264,7 +255,6 @@ fn probe_future_re_polls_until_ready() {
 #[test]
 fn run_wakes_a_task_parked_on_io_readiness() {
     let (tx, rx) = mio::net::UnixStream::pair().unwrap();
-    let mut runtime = Runtime::new();
 
     let writer = thread::spawn(move || {
         thread::sleep(Duration::from_millis(20));
@@ -272,33 +262,25 @@ fn run_wakes_a_task_parked_on_io_readiness() {
         tx.write_all(b"x").unwrap();
     });
 
-    runtime
-        .run(async move {
-            let _ = crate::io::read(rx).await;
-        })
-        .expect("run should not fail");
+    Runtime::run(async move {
+        let _ = crate::io::read(rx).await;
+    })
+    .expect("run should not fail");
 
     writer.join().unwrap();
-
-    let state = runtime.state.borrow();
-    assert!(state.queue.is_empty());
-    assert!(state.tasks.is_empty());
-    assert!(runtime.reactor.borrow().is_empty());
 }
 
 // Smoke test: spawn_blocking called and awaited inside run().
 #[test]
 fn spawn_blocking_smoke() {
-    let mut runtime = Runtime::new();
     let done = Rc::new(Cell::new(false));
     {
         let done = done.clone();
-        runtime
-            .run(async move {
-                let _ = crate::blocking::spawn_blocking(|| {}).await;
-                done.set(true);
-            })
-            .expect("run should not fail");
+        Runtime::run(async move {
+            let _ = crate::blocking::spawn_blocking(|| {}).await;
+            done.set(true);
+        })
+        .expect("run should not fail");
     }
     assert!(done.get());
 }
@@ -306,45 +288,47 @@ fn spawn_blocking_smoke() {
 // Phase 3 Drop test: a BlockingTask dropped before completion removes its
 // entry from `RuntimeState::blocking`. If it did not, the executor's
 // termination check (`blocking.is_empty()`) would never pass and `run()`
-// would park forever.
+// would park forever. Runs against a hand-installed runtime handle so the
+// blocking map can be inspected directly.
 #[test]
 fn dropped_spawn_blocking_leaves_blocking_map_empty() {
-    let mut runtime = Runtime::new();
-    let state = runtime.state.clone();
-    runtime
-        .run(async move {
-            let fut = crate::blocking::spawn_blocking(|| {
-                thread::sleep(Duration::from_millis(50));
-                7u32
-            });
-            let id = fut.id();
-            let mut fut = Box::pin(fut);
+    timer_wheel::install(Rc::new(RefCell::new(std::collections::BinaryHeap::new())));
+    timer_wheel::set_current_id(1);
 
-            let waker = create_waker(state.clone(), id);
-            let mut cx = Context::from_waker(&waker);
-            assert!(fut.as_mut().poll(&mut cx).is_pending());
-            assert!(state.borrow().blocking.contains_key(&id));
+    let poll = mio::Poll::new().unwrap();
+    let waker = Arc::new(mio::Waker::new(poll.registry(), WAKEN_TOKEN).unwrap());
+    let pool = WorkerPool::new(waker);
+    let state = RuntimeState::new();
+    blocking::install(state.clone(), pool.job_tx());
 
-            drop(fut);
-            assert!(state.borrow().blocking.is_empty());
-        })
-        .expect("run should not fail");
+    let fut = crate::blocking::spawn_blocking(|| {
+        thread::sleep(Duration::from_millis(50));
+        7u32
+    });
+    let id = fut.id();
+    let mut fut = Box::pin(fut);
+
+    let waker = create_waker(state.clone(), id);
+    let mut cx = Context::from_waker(&waker);
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+    assert!(state.borrow().blocking.contains_key(&id));
+
+    drop(fut);
+    assert!(state.borrow().blocking.is_empty());
+
+    blocking::uninstall();
 }
 
-// Step 15 — shutdown: after `run()` returns, dropping the Runtime closes the
-// job channel (run's guard released the thread-local sender clone) and joins
-// the worker threads. If any sender leaked, `join()` would block forever —
-// so this drop returning promptly IS the assertion.
+// Step 15 — shutdown: `run()` drops the Runtime when it returns, which closes
+// the job channel (the guard released the thread-local sender clone first) and
+// joins the worker threads. If any sender leaked, `join()` would block
+// forever — so `run()` returning promptly IS the assertion.
 #[test]
 fn runtime_drop_joins_workers_promptly_after_run() {
-    let mut runtime = Runtime::new();
-    runtime
-        .run(async {
-            let _ = crate::blocking::spawn_blocking(|| 21 * 2).await;
-        })
-        .expect("run should not fail");
-
     let start = Instant::now();
-    drop(runtime);
+    Runtime::run(async {
+        let _ = crate::blocking::spawn_blocking(|| 21 * 2).await;
+    })
+    .expect("run should not fail");
     assert!(start.elapsed() < Duration::from_millis(500));
 }

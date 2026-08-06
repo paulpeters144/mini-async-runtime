@@ -34,21 +34,19 @@ fn main() {
         *client_echo.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
     });
 
-    let mut runtime = Runtime::new();
-    runtime
-        .run(async move {
-            let (stream_a, _) = spawn_blocking(move || listener_a.accept().unwrap()).await;
-            let (stream_b, _) = spawn_blocking(move || listener_b.accept().unwrap()).await;
+    Runtime::run(async move {
+        let (stream_a, _) = spawn_blocking(move || listener_a.accept().unwrap()).await;
+        let (stream_b, _) = spawn_blocking(move || listener_b.accept().unwrap()).await;
 
-            let stream_a = non_blocking(stream_a);
-            let stream_b = non_blocking(stream_b);
+        let stream_a = non_blocking(stream_a);
+        let stream_b = non_blocking(stream_b);
 
-            let request = io::read(stream_a).await;
-            println!("server received {} bytes", request.len());
+        let request = io::read(stream_a).await;
+        println!("server received {} bytes", request.len());
 
-            io::write(stream_b, request).await;
-        })
-        .expect("run failed");
+        io::write(stream_b, request).await;
+    })
+    .expect("run failed");
 
     client.join().unwrap();
     println!("client got back: {}", echoed.lock().unwrap());

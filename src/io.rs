@@ -182,18 +182,16 @@ mod tests {
     // the bytes that were written.
     #[test]
     fn readable_returns_bytes_from_pair() {
-        let mut runtime = Runtime::new();
         let (mut tx, rx) = mio::net::UnixStream::pair().unwrap();
         tx.write_all(b"hello").unwrap();
 
         let result = Rc::new(RefCell::new(Vec::new()));
         let result_writer = result.clone();
-        runtime
-            .run(async move {
-                let bytes = read(rx).await;
-                *result_writer.borrow_mut() = bytes;
-            })
-            .expect("run should not fail");
+        Runtime::run(async move {
+            let bytes = read(rx).await;
+            *result_writer.borrow_mut() = bytes;
+        })
+        .expect("run should not fail");
 
         assert_eq!(result.borrow().as_slice(), b"hello");
     }
@@ -203,19 +201,17 @@ mod tests {
     // This proves an already-readable socket does not leak a registration.
     #[test]
     fn readable_from_an_unparked_source_completes() {
-        let mut runtime = Runtime::new();
         let (mut tx, rx) = mio::net::UnixStream::pair().unwrap();
         tx.write_all(b"x").unwrap();
 
         let got = Rc::new(Cell::new(false));
         let got_writer = got.clone();
-        runtime
-            .run(async move {
-                let bytes = read(rx).await;
-                assert_eq!(bytes, b"x");
-                got_writer.set(true);
-            })
-            .expect("run should not fail");
+        Runtime::run(async move {
+            let bytes = read(rx).await;
+            assert_eq!(bytes, b"x");
+            got_writer.set(true);
+        })
+        .expect("run should not fail");
 
         assert!(got.get());
     }
@@ -226,14 +222,12 @@ mod tests {
     // ever registering with the reactor — `Writable` returns `Ready` immediately.
     #[test]
     fn writable_flushes_bytes_to_pair() {
-        let mut runtime = Runtime::new();
         let (tx, mut rx) = mio::net::UnixStream::pair().unwrap();
 
-        runtime
-            .run(async move {
-                write(tx, b"world".to_vec()).await;
-            })
-            .expect("run should not fail");
+        Runtime::run(async move {
+            write(tx, b"world".to_vec()).await;
+        })
+        .expect("run should not fail");
 
         let mut buf = [0u8; 64];
         let n = rx.read(&mut buf).unwrap();
@@ -246,7 +240,6 @@ mod tests {
     // do not collide on the shared poller.
     #[test]
     fn readable_and_writable_coexist_on_separate_pairs() {
-        let mut runtime = Runtime::new();
         let (mut tx1, rx1) = mio::net::UnixStream::pair().unwrap();
         let (mut tx2, rx2) = mio::net::UnixStream::pair().unwrap();
         tx1.write_all(b"alpha").unwrap();
@@ -257,12 +250,11 @@ mod tests {
         let got1w = got1.clone();
         let got2w = got2.clone();
 
-        runtime
-            .run(async move {
-                *got1w.borrow_mut() = read(rx1).await;
-                *got2w.borrow_mut() = read(rx2).await;
-            })
-            .expect("run should not fail");
+        Runtime::run(async move {
+            *got1w.borrow_mut() = read(rx1).await;
+            *got2w.borrow_mut() = read(rx2).await;
+        })
+        .expect("run should not fail");
 
         assert_eq!(got1.borrow().as_slice(), b"alpha");
         assert_eq!(got2.borrow().as_slice(), b"beta");

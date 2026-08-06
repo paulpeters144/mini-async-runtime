@@ -32,27 +32,25 @@ fn main() {
         }
     });
 
-    let mut runtime = Runtime::new();
-    runtime
-        .run(async move {
-            for _ in 0..requests {
-                let l = Arc::clone(&listener);
-                let (stream, _) = spawn_blocking(move || l.accept().unwrap()).await;
-                let stream = {
-                    stream.set_nonblocking(true).unwrap();
-                    mio::net::TcpStream::from_std(stream)
-                };
+    Runtime::run(async move {
+        for _ in 0..requests {
+            let l = Arc::clone(&listener);
+            let (stream, _) = spawn_blocking(move || l.accept().unwrap()).await;
+            let stream = {
+                stream.set_nonblocking(true).unwrap();
+                mio::net::TcpStream::from_std(stream)
+            };
 
-                let request = io::read(stream).await;
-                let first_line = String::from_utf8_lossy(&request)
-                    .lines()
-                    .next()
-                    .unwrap_or("(empty request)")
-                    .to_string();
-                println!("  {first_line}");
-            }
-        })
-        .expect("run failed");
+            let request = io::read(stream).await;
+            let first_line = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or("(empty request)")
+                .to_string();
+            println!("  {first_line}");
+        }
+    })
+    .expect("run failed");
 
     client.join().unwrap();
 }

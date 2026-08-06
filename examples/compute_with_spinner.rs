@@ -20,38 +20,36 @@ fn main() {
 
     let job_progress = Arc::clone(&progress);
     let job_done = Arc::clone(&done);
-    let mut runtime = Runtime::new();
-    runtime
-        .run(async move {
-            // A stand-in for real work (compute, file copy, download). It
-            // reports its percent complete through the shared atomics.
-            let job = spawn_blocking(move || {
-                let mut acc: u64 = 0;
-                for step in 0..10u32 {
-                    // A few hundred thousand cheap iterations per chunk...
-                    for _ in 0..200_000 {
-                        acc = acc.wrapping_mul(31).wrapping_add(1);
-                    }
-                    // ...then a small sleep so the demo takes a visible beat.
-                    std::thread::sleep(Duration::from_millis(50));
-                    job_progress.store(((step + 1) * 10) as usize, Ordering::SeqCst);
+    Runtime::run(async move {
+        // A stand-in for real work (compute, file copy, download). It
+        // reports its percent complete through the shared atomics.
+        let job = spawn_blocking(move || {
+            let mut acc: u64 = 0;
+            for step in 0..10u32 {
+                // A few hundred thousand cheap iterations per chunk...
+                for _ in 0..200_000 {
+                    acc = acc.wrapping_mul(31).wrapping_add(1);
                 }
-                job_done.store(true, Ordering::SeqCst);
-                acc
-            });
-
-            let mut last = 0usize;
-            while !done.load(Ordering::SeqCst) {
-                sleep(Duration::from_millis(50)).await;
-                let p = progress.load(Ordering::SeqCst);
-                if p != last {
-                    println!("  {p}%");
-                    last = p;
-                }
+                // ...then a small sleep so the demo takes a visible beat.
+                std::thread::sleep(Duration::from_millis(50));
+                job_progress.store(((step + 1) * 10) as usize, Ordering::SeqCst);
             }
+            job_done.store(true, Ordering::SeqCst);
+            acc
+        });
 
-            let result = job.await;
-            println!("job finished with {result}");
-        })
-        .expect("run failed");
+        let mut last = 0usize;
+        while !done.load(Ordering::SeqCst) {
+            sleep(Duration::from_millis(50)).await;
+            let p = progress.load(Ordering::SeqCst);
+            if p != last {
+                println!("  {p}%");
+                last = p;
+            }
+        }
+
+        let result = job.await;
+        println!("job finished with {result}");
+    })
+    .expect("run failed");
 }

@@ -12,15 +12,13 @@ fn main() {
     let seconds = 5;
     let start = Instant::now();
 
-    let mut runtime = Runtime::new();
-    runtime
-        .run(async move {
-            for remaining in (0..seconds).rev() {
-                sleep(Duration::from_secs(1)).await;
-                println!("  {remaining}...");
-            }
-        })
-        .expect("run failed");
+    Runtime::run(async move {
+        for remaining in (0..seconds).rev() {
+            sleep(Duration::from_secs(1)).await;
+            println!("  {remaining}...");
+        }
+    })
+    .expect("run failed");
 
     println!("times up! (elapsed: {:?})", start.elapsed());
 }
