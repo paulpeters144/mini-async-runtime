@@ -15,12 +15,12 @@ use mar::timer_wheel::sleep;
 // The wall time is ~the job duration, not the sum: the spinner sleeps while the
 // worker grinds. This is the interleaving `tests/core.rs` proves.
 fn main() {
-    let progress = Arc::new(AtomicUsize::new(0));
-    let done = Arc::new(AtomicBool::new(false));
-
-    let job_progress = Arc::clone(&progress);
-    let job_done = Arc::clone(&done);
     Mar::run(async move {
+        let progress = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let job_progress = Arc::clone(&progress);
+        let job_done = Arc::clone(&done);
         // A stand-in for real work (compute, file copy, download). It
         // reports its percent complete through the shared atomics.
         let job = spawn_blocking(move || {

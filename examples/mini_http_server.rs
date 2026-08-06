@@ -17,22 +17,22 @@ use mar::io;
 // and writing a reply would need a second handle to the same connection, which
 // the current API does not return. Read it as a request logger.
 fn main() {
-    let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
-    let port = listener.local_addr().unwrap().port();
-    println!("http logger on 127.0.0.1:{port}");
-
-    let requests = 2;
-    let client = thread::spawn(move || {
-        for i in 0..requests {
-            let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            let req = format!("GET /page/{i} HTTP/1.0\r\nHost: example\r\n\r\n");
-            conn.write_all(req.as_bytes()).unwrap();
-            // Give the server a beat to read it before we drop the connection.
-            thread::sleep(Duration::from_millis(10));
-        }
-    });
-
     Mar::run(async move {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+        let port = listener.local_addr().unwrap().port();
+        println!("http logger on 127.0.0.1:{port}");
+
+        let requests = 2;
+        let client = thread::spawn(move || {
+            for i in 0..requests {
+                let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                let req = format!("GET /page/{i} HTTP/1.0\r\nHost: example\r\n\r\n");
+                conn.write_all(req.as_bytes()).unwrap();
+                // Give the server a beat to read it before we drop the connection.
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
         for _ in 0..requests {
             let l = Arc::clone(&listener);
             let (stream, _) = spawn_blocking(move || l.accept().unwrap()).await;
@@ -49,8 +49,8 @@ fn main() {
                 .to_string();
             println!("  {first_line}");
         }
+
+        client.join().unwrap();
     })
     .expect("run failed");
-
-    client.join().unwrap();
 }
