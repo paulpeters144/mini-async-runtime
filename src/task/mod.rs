@@ -1,5 +1,4 @@
 pub mod blocking;
-pub mod yield_now;
 pub(crate) mod worker_pool;
 
 use std::future::Future;
@@ -30,7 +29,6 @@ impl Task {
 }
 
 pub use blocking::spawn_blocking;
-pub use yield_now::yield_now;
 
 // A `Task` is the unit of work the executor owns: an id the waker uses to
 // reach it, plus the future itself. They check the two promises a task makes
