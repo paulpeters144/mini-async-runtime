@@ -2,8 +2,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use mar::Mar;
 use mar::blocking::spawn_blocking;
-use mar::executor::Runtime;
 use mar::timer_wheel::sleep;
 
 // Phase 3 milestone: `spawn_blocking` interleaves with a timer. `spawn_blocking`
@@ -20,7 +20,7 @@ fn spawn_blocking_interleaves_with_timer() {
     {
         let blocking_done = blocking_done.clone();
         let timer_fired = timer_fired.clone();
-        Runtime::run(async move {
+        Mar::run(async move {
             let blocking = spawn_blocking(|| {
                 std::thread::sleep(Duration::from_millis(200));
                 42u32
@@ -54,7 +54,7 @@ fn spawn_blocking_round_trip_value() {
     let got = Rc::new(RefCell::new(String::new()));
     {
         let got = got.clone();
-        Runtime::run(async move {
+        Mar::run(async move {
             let result = spawn_blocking(|| "hello worker".to_string()).await;
             *got.borrow_mut() = result;
         })
@@ -72,7 +72,7 @@ fn two_spawn_blockings_both_complete() {
     let completed = Rc::new(Cell::new(0usize));
     {
         let completed = completed.clone();
-        Runtime::run(async move {
+        Mar::run(async move {
             let result = spawn_blocking(move || 0u32).await;
             assert_eq!(result, 0);
             completed.set(completed.get() + 1);
@@ -93,7 +93,7 @@ fn two_spawn_blockings_both_complete() {
 #[test]
 #[should_panic(expected = "blocking closure exploded")]
 fn panicking_blocking_closure_makes_run_panic() {
-    let _ = Runtime::run(async {
+    let _ = Mar::run(async {
         let _ = spawn_blocking(|| -> () {
             panic!("blocking closure exploded");
         })

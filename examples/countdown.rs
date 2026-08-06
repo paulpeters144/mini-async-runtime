@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use mar::executor::Runtime;
+use mar::Mar;
 use mar::timer_wheel::sleep;
 
 // The simplest possible runtime program: a stopwatch that counts down. Each
@@ -9,16 +9,15 @@ use mar::timer_wheel::sleep;
 //
 // This example uses ONLY the timer wheel — no blocking work, no I/O.
 fn main() {
+    Mar::run(countdown()).expect("run failed");
+}
+
+async fn countdown() {
     let seconds = 5;
     let start = Instant::now();
-
-    Runtime::run(async move {
-        for remaining in (0..seconds).rev() {
-            sleep(Duration::from_secs(1)).await;
-            println!("  {remaining}...");
-        }
-    })
-    .expect("run failed");
-
+    for remaining in (0..seconds).rev() {
+        sleep(Duration::from_secs(1)).await;
+        println!("  {remaining}...");
+    }
     println!("times up! (elapsed: {:?})", start.elapsed());
 }

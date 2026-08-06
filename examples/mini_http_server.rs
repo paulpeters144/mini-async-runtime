@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use mar::Mar;
 use mar::blocking::spawn_blocking;
-use mar::executor::Runtime;
 use mar::io;
 
 // A minimal HTTP-shaped server: accept a connection on the worker pool, read
@@ -32,7 +32,7 @@ fn main() {
         }
     });
 
-    Runtime::run(async move {
+    Mar::run(async move {
         for _ in 0..requests {
             let l = Arc::clone(&listener);
             let (stream, _) = spawn_blocking(move || l.accept().unwrap()).await;

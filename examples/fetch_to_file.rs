@@ -1,7 +1,7 @@
+use mar::Mar;
 use mar::blocking::spawn_blocking;
-use mar::executor::Runtime;
 
-// The whole program is a single future passed to `Runtime::run()`: fetch the
+// The whole program is a single future passed to `Mar::run()`: fetch the
 // body, write it to examples/get-data.json, read it back, and print it. The
 // blocking HTTP and file I/O run on the worker pool via `spawn_blocking`; the
 // root future just awaits each result in sequence.
@@ -9,7 +9,7 @@ use mar::executor::Runtime;
 // The output file always lands in this repo's examples/ dir regardless of the
 // current working directory (CARGO_MANIFEST_DIR resolves at compile time).
 fn main() {
-    Runtime::run(async move {
+    Mar::run(async move {
         let body = spawn_blocking(|| {
             reqwest::blocking::get("https://jsonplaceholder.typicode.com/todos/1")
                 .expect("GET failed")

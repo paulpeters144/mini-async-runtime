@@ -173,7 +173,7 @@ impl<T: mio::event::Source> Drop for Writable<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::Runtime;
+    use crate::mar::Mar;
     use std::cell::{Cell, RefCell};
     use std::io::{Read, Write};
     use std::rc::Rc;
@@ -187,7 +187,7 @@ mod tests {
 
         let result = Rc::new(RefCell::new(Vec::new()));
         let result_writer = result.clone();
-        Runtime::run(async move {
+        Mar::run(async move {
             let bytes = read(rx).await;
             *result_writer.borrow_mut() = bytes;
         })
@@ -206,7 +206,7 @@ mod tests {
 
         let got = Rc::new(Cell::new(false));
         let got_writer = got.clone();
-        Runtime::run(async move {
+        Mar::run(async move {
             let bytes = read(rx).await;
             assert_eq!(bytes, b"x");
             got_writer.set(true);
@@ -224,7 +224,7 @@ mod tests {
     fn writable_flushes_bytes_to_pair() {
         let (tx, mut rx) = mio::net::UnixStream::pair().unwrap();
 
-        Runtime::run(async move {
+        Mar::run(async move {
             write(tx, b"world".to_vec()).await;
         })
         .expect("run should not fail");
@@ -250,7 +250,7 @@ mod tests {
         let got1w = got1.clone();
         let got2w = got2.clone();
 
-        Runtime::run(async move {
+        Mar::run(async move {
             *got1w.borrow_mut() = read(rx1).await;
             *got2w.borrow_mut() = read(rx2).await;
         })
@@ -269,7 +269,7 @@ mod tests {
         use crate::reactor;
         use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-        let runtime = Runtime::new();
+        let runtime = Mar::new();
         reactor::install(runtime.reactor.clone());
 
         let (tx, _rx) = mio::net::UnixStream::pair().unwrap();

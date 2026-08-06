@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-pub struct Runtime {
+pub struct Mar {
     state: Rc<RefCell<RuntimeState>>,
     wheel: TimerWheel,
     pub(crate) reactor: ReactorHandle,
@@ -20,7 +20,7 @@ pub struct Runtime {
     events: mio::Events,
 }
 
-impl Runtime {
+impl Mar {
     pub(crate) fn new() -> Self {
         let state = RuntimeState::new();
         let wheel = Rc::new(RefCell::new(std::collections::BinaryHeap::new()));
@@ -31,7 +31,7 @@ impl Runtime {
             WorkerPool::new(waker)
         };
         let events = mio::Events::with_capacity(64);
-        Runtime {
+        Mar {
             state,
             wheel,
             reactor,
@@ -150,7 +150,7 @@ impl Runtime {
     }
 }
 
-impl Default for Runtime {
+impl Default for Mar {
     fn default() -> Self {
         Self::new()
     }
@@ -171,7 +171,7 @@ use std::thread;
 // it to completion.
 #[test]
 fn new_runtime_has_empty_queue_and_task_map() {
-    let runtime = Runtime::new();
+    let runtime = Mar::new();
     let state = runtime.state.borrow();
     assert!(state.queue.is_empty());
     assert!(state.tasks.is_empty());
@@ -182,7 +182,7 @@ fn new_runtime_has_empty_queue_and_task_map() {
 // immediately with a clean state — no queue entries, no lingering tasks.
 #[test]
 fn run_returns_immediately_with_empty_future() {
-    Runtime::run(async {}).expect("run should not fail");
+    Mar::run(async {}).expect("run should not fail");
 }
 
 // A root future with no awaits completes on the first poll and the executor
@@ -192,7 +192,7 @@ fn run_completes_task_and_leaves_empty_state() {
     let polls = Rc::new(Cell::new(0usize));
     {
         let polls = polls.clone();
-        Runtime::run(async move {
+        Mar::run(async move {
             polls.set(polls.get() + 1);
         })
         .expect("run should not fail");
@@ -233,7 +233,7 @@ impl Future for Probe {
 #[test]
 fn probe_future_re_polls_until_ready() {
     let polls = Rc::new(Cell::new(0usize));
-    Runtime::run(Probe {
+    Mar::run(Probe {
         target: 3,
         polls: polls.clone(),
     })
@@ -262,7 +262,7 @@ fn run_wakes_a_task_parked_on_io_readiness() {
         tx.write_all(b"x").unwrap();
     });
 
-    Runtime::run(async move {
+    Mar::run(async move {
         let _ = crate::io::read(rx).await;
     })
     .expect("run should not fail");
@@ -276,7 +276,7 @@ fn spawn_blocking_smoke() {
     let done = Rc::new(Cell::new(false));
     {
         let done = done.clone();
-        Runtime::run(async move {
+        Mar::run(async move {
             let _ = crate::blocking::spawn_blocking(|| {}).await;
             done.set(true);
         })
@@ -319,14 +319,14 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
     blocking::uninstall();
 }
 
-// Step 15 — shutdown: `run()` drops the Runtime when it returns, which closes
+// Step 15 — shutdown: `run()` drops the Mar when it returns, which closes
 // the job channel (the guard released the thread-local sender clone first) and
 // joins the worker threads. If any sender leaked, `join()` would block
 // forever — so `run()` returning promptly IS the assertion.
 #[test]
 fn runtime_drop_joins_workers_promptly_after_run() {
     let start = Instant::now();
-    Runtime::run(async {
+    Mar::run(async {
         let _ = crate::blocking::spawn_blocking(|| 21 * 2).await;
     })
     .expect("run should not fail");

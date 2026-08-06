@@ -97,7 +97,7 @@ impl Drop for Sleep {
 /// Pause the current task for at least `duration`.
 ///
 /// This is a free function — it uses the thread-local `HANDLES` installed by
-/// `Runtime::run()` to discover the current task's id and the shared wheel.
+/// `Mar::run()` to discover the current task's id and the shared wheel.
 /// Calling it outside `run()` panics with a clear message.
 ///
 /// `sleep(Duration::ZERO)` is valid and completes immediately on the first
@@ -156,7 +156,7 @@ pub fn yield_now() -> YieldNow {
 /// Install a shared wheel into the thread-local `HANDLES` so free functions
 /// like `sleep()` can reach it.
 ///
-/// Called once by `Runtime::run()` at the start of execution.
+/// Called once by `Mar::run()` at the start of execution.
 pub(crate) fn install(wheel: TimerWheel) {
     HANDLES.with(|h| {
         *h.borrow_mut() = Some(WheelHandle {
@@ -244,7 +244,7 @@ pub(crate) fn expire_due(wheel: &TimerWheel) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::Runtime;
+    use crate::mar::Mar;
     use crate::runtime_state::RuntimeState;
     use crate::waker::create_waker;
     use std::cell::Cell;
@@ -278,7 +278,7 @@ mod tests {
         let flag = Rc::new(Cell::new(false));
         {
             let flag = flag.clone();
-            Runtime::run(async move {
+            Mar::run(async move {
                 sleep(Duration::ZERO).await;
                 flag.set(true);
             })
@@ -297,7 +297,7 @@ mod tests {
         let flag = Rc::new(Cell::new(false));
         {
             let flag = flag.clone();
-            Runtime::run(async move {
+            Mar::run(async move {
                 yield_now().await;
                 flag.set(true);
             })

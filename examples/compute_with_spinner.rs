@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use mar::Mar;
 use mar::blocking::spawn_blocking;
-use mar::executor::Runtime;
 use mar::timer_wheel::sleep;
 
 // A long-running blocking job and a progress indicator that run in parallel.
@@ -20,7 +20,7 @@ fn main() {
 
     let job_progress = Arc::clone(&progress);
     let job_done = Arc::clone(&done);
-    Runtime::run(async move {
+    Mar::run(async move {
         // A stand-in for real work (compute, file copy, download). It
         // reports its percent complete through the shared atomics.
         let job = spawn_blocking(move || {

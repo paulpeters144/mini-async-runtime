@@ -3,8 +3,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use mar::Mar;
 use mar::blocking::spawn_blocking;
-use mar::executor::Runtime;
 use mar::io;
 
 // A "server" whose handler is one root future: accept two connections, read a
@@ -34,7 +34,7 @@ fn main() {
         *client_echo.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
     });
 
-    Runtime::run(async move {
+    Mar::run(async move {
         let (stream_a, _) = spawn_blocking(move || listener_a.accept().unwrap()).await;
         let (stream_b, _) = spawn_blocking(move || listener_b.accept().unwrap()).await;
 
