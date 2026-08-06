@@ -19,6 +19,7 @@ impl WorkerPool {
     }
 
     /// Create a pool with `n` worker threads.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn with_count(waker: Arc<mio::Waker>, n: usize) -> Self {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let job_rx = Arc::new(Mutex::new(job_rx));

@@ -43,7 +43,7 @@ impl<R> Future for BlockingTask<R> {
                 .insert(this.id, cx.waker().clone());
             this.registered = true;
         } else if let Some(existing) = this.state.borrow_mut().blocking_wakers.get_mut(&this.id) {
-            *existing = cx.waker().clone();
+            existing.clone_from(cx.waker());
         }
 
         match this.rx.as_mut().unwrap().try_recv() {
@@ -77,6 +77,9 @@ impl<R> Drop for BlockingTask<R> {
     }
 }
 
+/// # Panics
+///
+/// Panics if the worker pool's job channel has been shut down.
 pub fn spawn_blocking<F, R>(f: F) -> BlockingTask<R>
 where
     F: FnOnce() -> R + Send + 'static,

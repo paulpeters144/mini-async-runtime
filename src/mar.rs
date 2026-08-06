@@ -41,18 +41,13 @@ impl Mar {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an I/O error if the reactor's OS poll fails.
     pub fn run<F>(future: F) -> io::Result<()>
     where
         F: Future<Output = ()> + 'static,
     {
-        let mut runtime = Self::new();
-
-        context::install(context::ContextHandle {
-            state: runtime.state.clone(),
-            wheel: runtime.wheel.clone(),
-            job_tx: runtime.pool.job_tx(),
-        });
-
         // Panic safety: if a task poll panics (e.g. a blocking closure's
         // payload is resumed inside `poll`), unwinding must still release the
         // thread-local job sender. Otherwise `WorkerPool::drop` would block
@@ -63,6 +58,14 @@ impl Mar {
                 context::uninstall();
             }
         }
+
+        let mut runtime = Self::new();
+
+        context::install(context::ContextHandle {
+            state: runtime.state.clone(),
+            wheel: runtime.wheel.clone(),
+            job_tx: runtime.pool.job_tx(),
+        });
         let _guard = ContextGuard;
 
         {
@@ -79,14 +82,10 @@ impl Mar {
                     let mut state = runtime.state.borrow_mut();
                     state.queue.pop_front()
                 };
-                let id = match next {
-                    Some(id) => id,
-                    None => break,
-                };
+                let Some(id) = next else { break; };
 
-                let mut task = match runtime.state.borrow_mut().tasks.remove(&id) {
-                    Some(task) => task,
-                    None => continue,
+                let Some(mut task) = runtime.state.borrow_mut().tasks.remove(&id) else {
+                    continue;
                 };
 
                 let waker = create_waker(runtime.state.clone(), id);
@@ -126,7 +125,7 @@ impl Mar {
 
             time::expire_due(&runtime.wheel);
 
-            for event in runtime.events.iter() {
+            for event in &runtime.events {
                 if event.token() == WAKEN_TOKEN {
                     // Collect first, then wake: `wake_by_ref` pushes the task
                     // id onto the queue — a `borrow_mut` on `state` — so the
@@ -150,8 +149,6 @@ impl Mar {
 
 #[cfg(test)]
 use std::cell::Cell;
-#[cfg(test)]
-use std::io::Write;
 #[cfg(test)]
 use std::pin::Pin;
 #[cfg(test)]
@@ -241,7 +238,7 @@ fn spawn_blocking_smoke() {
     {
         let done = done.clone();
         Mar::run(async move {
-            let _ = crate::task::spawn_blocking(|| {}).await;
+            let () = crate::task::spawn_blocking(|| {}).await;
             done.set(true);
         })
         .expect("run should not fail");
@@ -258,12 +255,12 @@ fn spawn_blocking_smoke() {
 fn dropped_spawn_blocking_leaves_blocking_map_empty() {
     let poll = mio::Poll::new().unwrap();
     let waker = Arc::new(mio::Waker::new(poll.registry(), WAKEN_TOKEN).unwrap());
-    let pool = WorkerPool::new(waker);
+    let worker_pool = WorkerPool::new(waker);
     let state = RuntimeState::new();
     context::install(context::ContextHandle {
         state: state.clone(),
         wheel: Rc::new(TimerHeap::new()),
-        job_tx: pool.job_tx(),
+        job_tx: worker_pool.job_tx(),
     });
 
     let fut = crate::task::spawn_blocking(|| {
@@ -292,7 +289,7 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
 fn runtime_drop_joins_workers_promptly_after_run() {
     let start = Instant::now();
     Mar::run(async {
-        let _ = crate::task::spawn_blocking(|| 21 * 2).await;
+        let _result = crate::task::spawn_blocking(|| 21 * 2).await;
     })
     .expect("run should not fail");
     assert!(start.elapsed() < Duration::from_millis(500));

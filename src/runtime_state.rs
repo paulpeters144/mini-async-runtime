@@ -13,6 +13,7 @@ pub struct RuntimeState {
 }
 
 impl RuntimeState {
+    #[must_use]
     pub fn new() -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(RuntimeState {
             queue: VecDeque::new(),

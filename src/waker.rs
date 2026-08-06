@@ -25,30 +25,30 @@ struct WakerData {
 const VTABLE: RawWakerVTable = RawWakerVTable::new(clone_raw, wake_raw, wake_by_raw_ref, drop_raw);
 
 fn clone_raw(data: *const ()) -> RawWaker {
-    let data = unsafe { Rc::from_raw(data as *const WakerData) };
+    let data = unsafe { Rc::from_raw(data.cast::<WakerData>()) };
     let cloned = data.clone();
-    let ptr = Rc::into_raw(cloned) as *const ();
+    let ptr = Rc::into_raw(cloned).cast::<()>();
     std::mem::forget(data);
     RawWaker::new(ptr, &VTABLE)
 }
 
 fn wake_raw(data: *const ()) {
-    let data = unsafe { Rc::from_raw(data as *const WakerData) };
+    let data = unsafe { Rc::from_raw(data.cast::<WakerData>()) };
     data.state.borrow_mut().queue.push_back(data.id);
 }
 
 fn wake_by_raw_ref(data: *const ()) {
-    let data = unsafe { &*(data as *const WakerData) };
+    let data = unsafe { &*(data.cast::<WakerData>()) };
     data.state.borrow_mut().queue.push_back(data.id);
 }
 
 fn drop_raw(data: *const ()) {
-    drop(unsafe { Rc::from_raw(data as *const WakerData) });
+    drop(unsafe { Rc::from_raw(data.cast::<WakerData>()) });
 }
 
 pub fn create_waker(state: Rc<RefCell<RuntimeState>>, id: usize) -> Waker {
     let data = Rc::new(WakerData { state, id });
-    let ptr = Rc::into_raw(data) as *const ();
+    let ptr = Rc::into_raw(data).cast::<()>();
     unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) }
 }
 
@@ -114,7 +114,7 @@ fn refcount_stays_balanced() {
 
     let waker = unsafe {
         Waker::from_raw(RawWaker::new(
-            Rc::into_raw(data.clone()) as *const (),
+            Rc::into_raw(data.clone()).cast::<()>(),
             &VTABLE,
         ))
     };

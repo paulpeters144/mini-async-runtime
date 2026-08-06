@@ -134,6 +134,7 @@ impl Drop for Sleep {
 ///
 /// `sleep(Duration::ZERO)` is valid and completes immediately on the first
 /// poll without ever entering the heap.
+#[must_use]
 pub fn sleep(duration: Duration) -> Sleep {
     let heap = crate::context::with(|ctx| ctx.wheel.clone());
     Sleep {

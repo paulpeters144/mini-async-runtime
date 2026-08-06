@@ -94,7 +94,7 @@ fn two_spawn_blockings_both_complete() {
 #[should_panic(expected = "blocking closure exploded")]
 fn panicking_blocking_closure_makes_run_panic() {
     let _ = Mar::run(async {
-        let _ = spawn_blocking(|| -> () {
+        let () = spawn_blocking(|| -> () {
             panic!("blocking closure exploded");
         })
         .await;

@@ -1,3 +1,4 @@
+pub mod all;
 pub mod blocking;
 pub(crate) mod worker_pool;
 
@@ -19,6 +20,7 @@ impl Task {
         Task { id, future }
     }
 
+    #[must_use]
     pub fn id(&self) -> usize {
         self.id
     }
@@ -28,6 +30,7 @@ impl Task {
     }
 }
 
+pub use all::all;
 pub use blocking::spawn_blocking;
 
 // A `Task` is the unit of work the executor owns: an id the waker uses to
@@ -46,7 +49,7 @@ pub use blocking::spawn_blocking;
 // Here we build a deliberately huge future and show the Task stays small.
 #[test]
 fn new_wraps_future_with_id() {
-    struct HugeFuture([u8; 64 * 1024]);
+    struct HugeFuture(Box<[u8; 64 * 1024]>);
 
     impl Future for HugeFuture {
         type Output = ();
@@ -57,7 +60,9 @@ fn new_wraps_future_with_id() {
         }
     }
 
-    let task = Task::new(7, HugeFuture([0; 64 * 1024]));
+    #[allow(clippy::large_stack_arrays)]
+    let huge_data = Box::new([0; 64 * 1024]);
+    let task = Task::new(7, HugeFuture(huge_data));
 
     assert_eq!(task.id(), 7);
 

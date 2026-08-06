@@ -17,6 +17,10 @@ pub struct Reactor {
 }
 
 impl Reactor {
+    /// # Panics
+    ///
+    /// Panics if the underlying OS poller cannot be created.
+    #[must_use]
     pub fn new() -> Self {
         let poll = mio::Poll::new().unwrap();
         let registry = HashMap::new();
@@ -37,10 +41,14 @@ impl Reactor {
         token
     }
 
+    #[must_use]
     pub fn registry(&self) -> &mio::Registry {
         self.poll.registry()
     }
 
+    /// # Errors
+    ///
+    /// Returns an I/O error if the underlying OS poll fails.
     pub fn park(&mut self, events: &mut mio::Events, timeout: Option<Duration>) -> io::Result<()> {
         self.poll.poll(events, timeout)
     }
@@ -49,10 +57,9 @@ impl Reactor {
         self.registry.insert(token, waker);
     }
 
-    /// Register a source with the poller so its readiness fires `token` events.
+    /// # Errors
     ///
-    /// The I/O wrapper futures call this (via `with`) instead of touching the
-    /// raw `mio::Registry` themselves.
+    /// Returns an I/O error if source registration fails at the OS level.
     pub fn register_source(
         &mut self,
         source: &mut impl mio::event::Source,
@@ -63,6 +70,10 @@ impl Reactor {
     }
 
     /// Remove a source from the poller and forget its waker entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if deregistration fails at the OS level.
     pub fn deregister_source(
         &mut self,
         source: &mut impl mio::event::Source,
@@ -74,6 +85,7 @@ impl Reactor {
     }
 
     /// Part of `run()`'s termination check.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.registry.is_empty()
     }
@@ -85,9 +97,12 @@ impl Default for Reactor {
     }
 }
 
+/// # Panics
+///
+/// Panics if an event's token has no registered waker.
 pub fn dispatch(handle: &ReactorHandle, events: &mio::Events) {
     let reactor = handle.borrow_mut();
-    for event in events.iter() {
+    for event in events {
         let token = event.token();
         if token == WAKEN_TOKEN {
             continue;

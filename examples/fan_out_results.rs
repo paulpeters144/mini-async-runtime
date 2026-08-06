@@ -1,42 +1,29 @@
 use std::time::{Duration, Instant};
 
 use mar::Mar;
-use mar::task::spawn_blocking;
+use mar::task;
 use mar::time::sleep;
+
+async fn delay(msg: &str, dur: Duration) -> &str {
+    sleep(dur).await;
+    msg
+}
 
 fn main() {
     Mar::run(async move {
         let start = Instant::now();
 
-        let job_1 = spawn_blocking(|| {
-            std::thread::sleep(Duration::from_millis(200));
-            "job 1"
-        });
-        let job_2 = spawn_blocking(|| {
-            std::thread::sleep(Duration::from_millis(300));
-            "job 2"
-        });
-        let job_3 = spawn_blocking(|| {
-            std::thread::sleep(Duration::from_millis(250));
-            "job 3"
-        });
+        let jobs = [
+            delay("job 1", Duration::from_millis(200)),
+            delay("job 2", Duration::from_millis(300)),
+            delay("job 3", Duration::from_millis(100)),
+        ];
 
-        println!("dispatched 3 jobs");
+        println!("started {} jobs", jobs.len());
 
-        for i in 1..=3 {
-            sleep(Duration::from_millis(100)).await;
-            println!("  tick {i}");
-        }
+        let [r1, r2, r3] = task::all(jobs).await;
 
-        let r1 = job_1.await;
-        println!("{r1} done — {:?}", start.elapsed());
-
-        let r2 = job_2.await;
-        println!("{r2} done — {:?}", start.elapsed());
-
-        let r3 = job_3.await;
-        println!("{r3} done — {:?}", start.elapsed());
-
+        println!("complete: {r1}, {r2}, {r3}");
         println!("total: {:?}", start.elapsed());
     })
     .expect("run failed");
