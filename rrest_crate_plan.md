@@ -164,6 +164,7 @@ impl<C: Connection> Connection for TlsStream<C> { ... }
 
 - **Unit tests:** URL parsing, request building, `httparse` parsing — no real I/O.
 - **Integration tests:** A test-only `Factory` that uses `std::net::TcpStream` (blocking) wrapped in a `Send` adapter. Tests run via `pollster::block_on`.
+- **Test safety:** `Rrest::init()` panics if called twice (single `OnceLock`). Integration tests that call `init` must either isolate into separate test binaries or use `std::sync::Once` to ensure single initialization per binary.
 
 ```rust
 #[cfg(test)]
