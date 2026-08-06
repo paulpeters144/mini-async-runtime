@@ -4,7 +4,7 @@ To get a simple, single-threaded runtime working, you need **6 core components**
 
 ## Progress at a Glance (full details in each phase's Build Order below)
 
-**Phase 1 — runtime core + timers (current):**
+**Phase 1 — runtime core + timers (done):**
 
 - [x] **Step 1** — `Task` wrapper (`id` + `Pin<Box<dyn Future>>`)
 - [x] **Step 2** — `RuntimeState` (ready queue + task map + `next_id`)
@@ -21,12 +21,12 @@ To get a simple, single-threaded runtime working, you need **6 core components**
 - [x] **Step 10** — Replaced custom `HttpFuture` with `reqwest::blocking` (via `spawn_blocking`, Phase 3)
 - [x] **Step 11** — Echo demo
 
-**Phase 3 — `spawn_blocking` (deferred):**
+**Phase 3 — `spawn_blocking` (done):**
 
-- [ ] **Step 12** — `WorkerPool`
-- [ ] **Step 13** — `BlockingTask` + `WAKEN`
-- [ ] **Step 14** — Panic semantics
-- [ ] **Step 15** — Shutdown
+- [x] **Step 12** — `WorkerPool`
+- [x] **Step 13** — `BlockingTask` + `WAKEN`
+- [x] **Step 14** — Panic semantics
+- [x] **Step 15** — Shutdown
 
 
 > **Memory model decision (locked in, with one deliberate exception):** Pure `Rc` for **all runtime state on the executor thread**. The entire runtime — every future, the ready queue, the timer wheel, the reactor registry — is `!Send` and lives on one thread. No `Arc`, no `Mutex`, no channels *on the executor side*. This keeps the Waker vtable as simple as possible and the `Send`/`Sync` question disappears for everything the executor touches. **The single exception is the Phase 3 `spawn_blocking` boundary (section 7):** a worker thread must receive a closure and hand back a result, which requires `std::sync::mpsc` channels + a `mio::Waker` — the only `Send` types in the whole crate. Everything else stays `!Send`. (Trade-off: the *executor* can never grow into a multi-threaded scheduler — that's fine, that's the point. Workers offload blocking work; they never poll futures.)
@@ -41,7 +41,7 @@ To get a simple, single-threaded runtime working, you need **6 core components**
     - the counter hit its expected value (proves tasks interleave and re-poll correctly, deterministically via yields);
     - `run()` returns cleanly with no tasks left in the queue, task map, or timer wheel.
 - **Phase 2 (done):** Reactor I/O dispatch + generic `Readable<T>`/`Writable<T>` futures (replaces the original `AsyncTcpStream` plan). Steps 8–11 complete. Step 10 (`HttpFuture`) replaced with `reqwest::blocking` — HTTP is now a Phase 3 concern (uses `spawn_blocking`).
-- **Phase 3 (follow-up plan, deferred):** `spawn_blocking` + a worker pool — the escape hatch that makes **file reads** (and any blocking call) non-blocking by running them on worker threads (section 7).
+- **Phase 3 (done):** `spawn_blocking` + a worker pool — the escape hatch that makes **file reads** (and any blocking call) non-blocking by running them on worker threads (section 7).
 - **Deliberately excluded:** a multi-threaded *executor* (Phase 3 adds worker threads for blocking offload only — workers never poll futures), `JoinHandle`s returning values, macro wrappers like `#[runtime::main]`/`block_on` sugar beyond `run()`.
 
 ---
@@ -76,10 +76,9 @@ src/
   timer_wheel.rs # ✓ done — TimerWheel, Sleep, YieldNow, free functions, thread-local helpers + 5 tests
   reactor.rs    # ✓ done — Reactor { poll, registry, next_token } + allocate_token(), dispatch(), register/deregister_source, thread-local with()
   io.rs         # ✓ done — Readable<T>, Writable<T>, read(), write(), Future/Drop impls + 6 tests
-  blocking.rs   # — Phase 3: WorkerPool, BlockingTask, spawn_blocking()
+  blocking.rs   # ✓ done — WorkerPool, BlockingTask, spawn_blocking()
 tests/
-  core.rs       # ✓ done — step 6's concurrency demo (the milestone test) lives here
-  blocking.rs   # — Phase 3: worker/interleave integration tests (file-read milestone)
+  core.rs       # ✓ done — the acceptance suite: step 6's concurrency demo, the Phase 2 echo demo, and the Phase 3 spawn_blocking integration tests (interleave, round-trip, concurrent, worker-panic)
 ```
 
 Each module carries `#[cfg(test)] mod tests` for its own unit tests; `tests/core.rs` is the black-box acceptance suite.
@@ -354,9 +353,9 @@ where
 **Components:**
 
 - `WorkerPool { job_tx: mpsc::Sender<Job>, workers: Vec<JoinHandle<()>> }` — a fixed pool (default **1 worker thread**; a `Vec` you can size later). Each worker loops `job_rx.recv()`, runs the closure, and calls the shared `mio::Waker`. Workers exit when the channel closes.
-- `mio::Waker` — registered once on the reactor `Poll` under a reserved `WAKEN` token (e.g. `Token(usize::MAX)`). It is the one object workers hold (`Send` + `Clone`). Its entire job: after a job finishes, `wake()` makes the executor's blocked `Poll::poll(timeout)` return *immediately* with the `WAKEN` token. Without it, the executor could park on `None` forever while a worker is mid-read.
+- `mio::Waker` — registered once on the reactor `Poll` under the reserved `WAKEN` token (`Token(0)`; the token allocator starts at 1). It is the one object workers hold (`Send` + `Clone`). Its entire job: after a job finishes, `wake()` makes the executor's blocked `Poll::poll(timeout)` return *immediately* with the `WAKEN` token. Without it, the executor could park on `None` forever while a worker is mid-read.
 - `BlockingTask<R>` — a future, the mirror of `Sleep` (same id/waker discipline, same `Drop` cleanup):
-  1. **First poll:** allocate a `blocking_id`, create `(tx, rx) = std::sync::mpsc::channel::<R>()`, wrap the closure so it runs `f()` and sends the result through `tx`, push the job onto `job_tx`, save `cx.waker()` in `RuntimeState::blocking[blocking_id]`, return `Pending`.
+  1. **First poll:** allocate a `blocking_id`, create `(tx, rx) = std::sync::mpsc::channel::<thread::Result<R>>()` (the extra `Result` layer carries panic payloads, see below), wrap the closure so it runs `f()` and sends the result through `tx`, push the job onto `job_tx`, save `cx.waker()` in `RuntimeState::blocking[blocking_id]`, return `Pending`.
   2. **Later polls:** `rx.try_recv()` — **never blocks, which is the whole point**. Result in → `Ready(result)` and remove the `RuntimeState::blocking` entry. Not yet → re-arm the waker, stay `Pending`.
   3. **`Drop`:** remove `RuntimeState::blocking[blocking_id]` — the same cancellation discipline as the timer `Drop` trap (section 5). A task that abandons its `BlockingTask` must not leave a stale waker behind.
 
@@ -436,19 +435,19 @@ Each step is: **write the failing test → make it pass → refactor.** Tests li
 - **Step 6** — Bring in `mio::Poll` as the park primitive (**done**: `thread::sleep(timeout)` → `self.poll.poll(&mut self.events, timeout)?`; zero registered sources in Phase 1). The wheel was *already wired* into the executor: `runtime.wheel`, `install`/`set_current_id`/`clear_current_id`, park timeout from `next_deadline`, expire/termination gates. *Test:* the **concurrency demo** — concurrent sleeps + a `yield_now()` counter task, asserting `elapsed >= max_duration`, `elapsed < max_duration * 2`, and the exact counter value (this is the milestone test) in `tests/core.rs`.
 - **Step 7** — Finalize `Runtime::new()` → `io::Result<Self>` + audit that no non-test code `unwrap`s. **Deferred by decision:** `mio::Poll::new()` is already integrated, but `new()` still returns plain `Self` (`.unwrap()` on `Poll::new()`) to keep `Default` derivable. Revisit here.
 
-## Build Order — Phase 2 (in progress)
+## Build Order — Phase 2 (done)
 
 - **Step 8** — Reactor dispatch: register a `mio::net::UnixStream::pair()` as a test source, drive events through the token→waker registry, assert a write on one end wakes the task polling the other. (Real fds, no network, no server.) **done** — `reactor.rs` has `Reactor`, `allocate_token()`, `register()`/`deregister()`, `register_source()`/`deregister_source()`, `dispatch()`, and 6 unit tests.
 - **Step 9** — Generic I/O wrappers: `Readable<T>` / `Writable<T>` futures in `src/io.rs`. Any `mio::event::Source + Read`/`Write` — not TCP-specific. `WouldBlock` → register + store waker + `Pending`; data ready → deregister + `Ready`. `Drop` deregisters on cancellation (mirrors `Sleep`). Supersedes the original `AsyncTcpStream` plan. *Tests:* 6 tests covering read/write round-trip, coexisting pairs, the full reader+writer pipe, and partial-write waker storage. **done**
 - **Step 10** — HTTP via `reqwest::blocking`: removed custom `HttpFuture` in favor of `reqwest`'s blocking API, called through `spawn_blocking` (Phase 3). This keeps the crate tokio-free — `reqwest::blocking` manages its own internal runtime per-request. The demo shows both an HTTP GET and a file read offloaded to worker threads.
 - **Step 11** — Echo demo: Phase 2 milestone integration test in `tests/core.rs`. Two concurrent tasks exchange bytes over a `UnixStream::pair()` via the public `io::read` / `io::write` futures, all inside one `run()`. Proves the full reactor chain end-to-end from the user-facing API. **done**
 
-## Build Order — Phase 3 (`spawn_blocking` + workers, deferred)
+## Build Order — Phase 3 (`spawn_blocking` + workers, done)
 
-- **Step 12** — Build `WorkerPool` in isolation (pure `std`, no runtime): a job channel + N worker threads, each `recv` → run → drop. *Tests:* a worker runs a closure and the result is observable; workers exit when the channel closes (no thread leaks).
-- **Step 13** — Add `BlockingTask` + the `WAKEN` wake path. *Tests:* the milestone — `spawn_blocking(read big file)` interleaves with a `sleep(50ms)` task; round-trip value correctness; two concurrent `spawn_blocking`s both complete; a cancelled `BlockingTask` leaves `RuntimeState::blocking` empty (the Phase 3 `Drop` test).
-- **Step 14** — Worker panic semantics: `catch_unwind` in the worker, ship the payload through the result channel, `resume_unwind` on the task's next poll. *Test:* a panicking closure makes `run()` panic — never hang.
-- **Step 15** — Finalize shutdown: close the job channel and join the workers on `Runtime` drop. *Test:* after `run()`, every worker thread has exited.
+- **Step 12** — Build `WorkerPool` in isolation (pure `std`, no runtime): a job channel + N worker threads, each `recv` → run → drop. *Tests:* a worker runs a closure and the result is observable; workers exit when the channel closes (no thread leaks). **done** — `src/blocking.rs`, 4 unit tests.
+- **Step 13** — Add `BlockingTask` + the `WAKEN` wake path. *Tests:* the milestone — `spawn_blocking(read big file)` interleaves with a `sleep(50ms)` task; round-trip value correctness; two concurrent `spawn_blocking`s both complete; a cancelled `BlockingTask` leaves `RuntimeState::blocking` empty (the Phase 3 `Drop` test). **done** — milestone/round-trip/two-concurrent in `tests/core.rs` (a 200ms worker closure stands in for the file read), the Drop test in `executor.rs`. Fixed two latent bugs this exposed: the WAKEN dispatch held `state.borrow()` across `wake_by_ref()` (a `borrow_mut`) → double-borrow panic, and the panic unwind skipped `blocking::uninstall()` → `WorkerPool::drop` hung joining the worker.
+- **Step 14** — Worker panic semantics: `catch_unwind` in the worker, ship the payload through the result channel, `resume_unwind` on the task's next poll. *Test:* a panicking closure makes `run()` panic — never hang. **done** — the channel carries `thread::Result<R>`; the worker loop also catches raw-job panics so a worker is never killed; `#[should_panic]` test in `tests/core.rs`.
+- **Step 15** — Finalize shutdown: close the job channel and join the workers on `Runtime` drop. *Test:* after `run()`, every worker thread has exited. **done** — a drop guard in `run()` releases the thread-local job sender on every exit path (including panic unwinds), so the channel closes and `join()` returns; `executor.rs` test asserts `drop(runtime)` is prompt after blocking work.
 
 ---
 

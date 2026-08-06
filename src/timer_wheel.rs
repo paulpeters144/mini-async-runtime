@@ -193,6 +193,21 @@ pub(crate) fn clear_current_id() {
     });
 }
 
+/// Return the current task id — set by the executor before each poll.
+///
+/// Used by `spawn_blocking()` to learn which calling task is waiting on
+/// the worker result.
+pub(crate) fn current_id() -> usize {
+    HANDLES.with(|h| {
+        h.borrow()
+            .as_ref()
+            .expect("runtime handles not installed")
+            .current_id
+            .get()
+            .expect("current_id not set")
+    })
+}
+
 /// Return the earliest deadline in the wheel, if any.
 ///
 /// The executor uses this to compute its park timeout: `deadline - now`.

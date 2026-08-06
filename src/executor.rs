@@ -1,4 +1,5 @@
-use crate::reactor::{self, Reactor, ReactorHandle};
+use crate::blocking::{self, WorkerPool};
+use crate::reactor::{self, Reactor, ReactorHandle, WAKEN_TOKEN};
 use crate::runtime_state::RuntimeState;
 use crate::task::Task;
 use crate::timer_wheel::{self, TimerWheel};
@@ -7,13 +8,16 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::io::{self};
 use std::rc::Rc;
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 pub struct Runtime {
     state: Rc<RefCell<RuntimeState>>,
     wheel: TimerWheel,
     pub(crate) reactor: ReactorHandle,
+    pool: WorkerPool,
+    _waker: Arc<mio::Waker>,
     events: mio::Events,
 }
 
@@ -22,11 +26,18 @@ impl Runtime {
         let state = RuntimeState::new();
         let wheel = Rc::new(RefCell::new(std::collections::BinaryHeap::new()));
         let reactor = Rc::new(RefCell::new(Reactor::new()));
+        let waker = {
+            let reactor_ref = reactor.borrow();
+            Arc::new(mio::Waker::new(reactor_ref.registry(), WAKEN_TOKEN).unwrap())
+        };
+        let pool = WorkerPool::new(waker.clone());
         let events = mio::Events::with_capacity(64);
         Runtime {
             state,
             wheel,
             reactor,
+            pool,
+            _waker: waker,
             events,
         }
     }
@@ -45,6 +56,19 @@ impl Runtime {
     pub fn run(&mut self) -> io::Result<()> {
         timer_wheel::install(self.wheel.clone());
         reactor::install(self.reactor.clone());
+        blocking::install(self.state.clone(), self.pool.job_tx());
+
+        // Panic safety: if a task poll panics (e.g. a blocking closure's
+        // payload is resumed inside `poll`), unwinding must still release the
+        // thread-local job sender. Otherwise `WorkerPool::drop` would block
+        // forever joining a worker whose channel never closed.
+        struct BlockingUninstall;
+        impl Drop for BlockingUninstall {
+            fn drop(&mut self) {
+                blocking::uninstall();
+            }
+        }
+        let _guard = BlockingUninstall;
 
         loop {
             loop {
@@ -78,25 +102,44 @@ impl Runtime {
                 let state = self.state.borrow();
                 let wheel = self.wheel.borrow();
                 let reactor = self.reactor.borrow();
-                state.tasks.is_empty() && wheel.is_empty() && reactor.is_empty()
+                state.tasks.is_empty()
+                    && wheel.is_empty()
+                    && reactor.is_empty()
+                    && state.blocking.is_empty()
             };
             if done {
                 return Ok(());
             }
 
-            let timeout = timer_wheel::next_deadline(&self.wheel)
-                .map(|deadline| {
-                    let now = Instant::now();
-                    if deadline > now {
-                        deadline - now
-                    } else {
-                        Duration::ZERO
-                    }
-                });
+            let timeout = timer_wheel::next_deadline(&self.wheel).map(|deadline| {
+                let now = Instant::now();
+                if deadline > now {
+                    deadline - now
+                } else {
+                    Duration::ZERO
+                }
+            });
             self.reactor.borrow_mut().park(&mut self.events, timeout)?;
 
             for id in timer_wheel::expire_due(&self.wheel) {
                 self.state.borrow_mut().queue.push_back(id);
+            }
+
+            for event in self.events.iter() {
+                if event.token() == WAKEN_TOKEN {
+                    // Collect first, then wake: `wake_by_ref` pushes the task
+                    // id onto the queue — a `borrow_mut` on `state` — so the
+                    // immutable borrow used for iteration must be released
+                    // before any waker fires, or the RefCell double-borrows
+                    // and panics.
+                    let wakers: Vec<Waker> = {
+                        let state = self.state.borrow();
+                        state.blocking.values().cloned().collect()
+                    };
+                    for waker in &wakers {
+                        waker.wake_by_ref();
+                    }
+                }
             }
 
             reactor::dispatch(&self.reactor, &self.events);
@@ -289,4 +332,67 @@ fn two_tasks_exchange_bytes_over_a_socket_pipe() {
 
     assert_eq!(got.borrow().as_slice(), b"ping");
     assert!(runtime.reactor.borrow().is_empty());
+}
+
+// Smoke test: spawn_blocking called and awaited inside run().
+#[test]
+fn spawn_blocking_smoke() {
+    let mut runtime = Runtime::new();
+    let done = Rc::new(Cell::new(false));
+    {
+        let done = done.clone();
+        runtime.spawn(async move {
+            let _ = crate::blocking::spawn_blocking(|| {}).await;
+            done.set(true);
+        });
+    }
+    runtime.run().expect("run should not fail");
+    assert!(done.get());
+}
+
+// Phase 3 Drop test: a BlockingTask dropped before completion removes its
+// entry from `RuntimeState::blocking`. If it did not, the executor's
+// termination check (`blocking.is_empty()`) would never pass and `run()`
+// would park forever.
+#[test]
+fn dropped_spawn_blocking_leaves_blocking_map_empty() {
+    let mut runtime = Runtime::new();
+    runtime.spawn(async {
+        let fut = crate::blocking::spawn_blocking(|| {
+            thread::sleep(Duration::from_millis(50));
+            7u32
+        });
+        let state = fut.state();
+        let id = fut.id();
+        let mut fut = Box::pin(fut);
+
+        // First poll registers the task's waker in the blocking map and pends.
+        let waker = create_waker(state.clone(), id);
+        let mut cx = Context::from_waker(&waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert!(state.borrow().blocking.contains_key(&id));
+
+        // Cancel: drop before the worker finishes. The entry must go.
+        drop(fut);
+        assert!(state.borrow().blocking.is_empty());
+    });
+
+    runtime.run().expect("run should not fail");
+}
+
+// Step 15 — shutdown: after `run()` returns, dropping the Runtime closes the
+// job channel (run's guard released the thread-local sender clone) and joins
+// the worker threads. If any sender leaked, `join()` would block forever —
+// so this drop returning promptly IS the assertion.
+#[test]
+fn runtime_drop_joins_workers_promptly_after_run() {
+    let mut runtime = Runtime::new();
+    runtime.spawn(async {
+        let _ = crate::blocking::spawn_blocking(|| 21 * 2).await;
+    });
+    runtime.run().expect("run should not fail");
+
+    let start = Instant::now();
+    drop(runtime);
+    assert!(start.elapsed() < Duration::from_millis(500));
 }

@@ -7,6 +7,9 @@ use std::time::Duration;
 
 pub(crate) type ReactorHandle = Rc<RefCell<Reactor>>;
 
+/// Reserved token for cross-thread worker-completion wakes (Phase 3).
+pub const WAKEN_TOKEN: mio::Token = mio::Token(0);
+
 pub struct Reactor {
     poll: mio::Poll,
     registry: HashMap<mio::Token, Waker>,
@@ -20,7 +23,7 @@ impl Reactor {
         Reactor {
             poll,
             registry,
-            next_token: 0,
+            next_token: 1, // Token(0) is reserved for WAKEN
         }
     }
 
@@ -112,6 +115,9 @@ pub fn dispatch(handle: &ReactorHandle, events: &mio::Events) {
     let reactor = handle.borrow_mut();
     for event in events.iter() {
         let token = event.token();
+        if token == WAKEN_TOKEN {
+            continue;
+        }
         match reactor.registry.get(&token) {
             Some(waker) => waker.wake_by_ref(),
             None => panic!("event token {token:?} has no registered waker"),

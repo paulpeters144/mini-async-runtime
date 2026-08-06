@@ -1,3 +1,4 @@
+pub mod blocking;
 pub mod executor;
 pub mod io;
 pub mod reactor;
