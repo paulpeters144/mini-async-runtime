@@ -1,9 +1,10 @@
-use crate::blocking::{self, WorkerPool};
+use crate::blocking;
 use crate::reactor::{self, Reactor, ReactorHandle, WAKEN_TOKEN};
 use crate::runtime_state::RuntimeState;
 use crate::task::Task;
 use crate::timer_wheel::{self, TimerWheel};
 use crate::waker::create_waker;
+use crate::worker_pool::WorkerPool;
 use std::cell::RefCell;
 use std::future::Future;
 use std::io::{self};
