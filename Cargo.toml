@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mio = { version = "0.8", features = ["os-poll", "net"] }
+mio = { version = "0.8", features = ["os-poll"] }
 rrest = { path = "crates/rrest" }

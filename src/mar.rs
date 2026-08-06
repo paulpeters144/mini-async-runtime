@@ -1,10 +1,10 @@
 use crate::context;
-use crate::reactor::{self, Reactor, ReactorHandle, WAKEN_TOKEN};
+use crate::reactor::{Reactor, ReactorHandle};
 use crate::runtime_state::RuntimeState;
 use crate::task::Task;
+use crate::task::worker_pool::WorkerPool;
 use crate::time::{self, TimerHeap};
 use crate::waker::create_waker;
-use crate::task::worker_pool::WorkerPool;
 use std::cell::RefCell;
 use std::future::Future;
 use std::io::{self};
@@ -12,6 +12,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
+
+const WAKEN_TOKEN: mio::Token = mio::Token(0);
 
 pub struct Mar {
     pub(crate) state: Rc<RefCell<RuntimeState>>,
@@ -82,7 +84,9 @@ impl Mar {
                     let mut state = runtime.state.borrow_mut();
                     state.queue.pop_front()
                 };
-                let Some(id) = next else { break; };
+                let Some(id) = next else {
+                    break;
+                };
 
                 let Some(mut task) = runtime.state.borrow_mut().tasks.remove(&id) else {
                     continue;
@@ -100,10 +104,8 @@ impl Mar {
 
             let done = {
                 let state = runtime.state.borrow();
-                let reactor = runtime.reactor.borrow();
                 state.tasks.is_empty()
                     && runtime.wheel.is_empty()
-                    && reactor.is_empty()
                     && state.blocking_wakers.is_empty()
             };
             if done {
@@ -141,8 +143,6 @@ impl Mar {
                     }
                 }
             }
-
-            reactor::dispatch(&runtime.reactor, &runtime.events);
         }
     }
 }
