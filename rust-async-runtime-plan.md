@@ -18,7 +18,7 @@ To get a simple, single-threaded runtime working, you need **6 core components**
 
 - [x] **Step 8** — Reactor dispatch (token→waker registry, `park`, `dispatch`)
 - [x] **Step 9** — Generic `Readable<T>` / `Writable<T>` I/O futures (`src/io.rs`); supersedes the original `AsyncTcpStream` plan — works with any `mio::event::Source`
-- [ ] **Step 10** — `HttpGetFuture`
+- [x] **Step 10** — Replaced custom `HttpFuture` with `reqwest::blocking` (via `spawn_blocking`, Phase 3)
 - [ ] **Step 11** — Echo demo
 
 **Phase 3 — `spawn_blocking` (deferred):**
@@ -40,7 +40,7 @@ To get a simple, single-threaded runtime working, you need **6 core components**
     - total wall-clock time ≈ the *max* sleep duration (proves the executor parks instead of busy-looping or serializing);
     - the counter hit its expected value (proves tasks interleave and re-poll correctly, deterministically via yields);
     - `run()` returns cleanly with no tasks left in the queue, task map, or timer wheel.
-- **Phase 2 (partially done):** Reactor I/O dispatch + generic `Readable<T>`/`Writable<T>` futures (replaces the original `AsyncTcpStream` plan). Steps 8–9 complete; `HttpGetFuture` and echo demo still deferred.
+- **Phase 2 (partially done):** Reactor I/O dispatch + generic `Readable<T>`/`Writable<T>` futures (replaces the original `AsyncTcpStream` plan). Steps 8–9 complete; echo demo still deferred. Step 10 (`HttpFuture`) replaced with `reqwest::blocking` — HTTP is now a Phase 3 concern (uses `spawn_blocking`).
 - **Phase 3 (follow-up plan, deferred):** `spawn_blocking` + a worker pool — the escape hatch that makes **file reads** (and any blocking call) non-blocking by running them on worker threads (section 7).
 - **Deliberately excluded:** a multi-threaded *executor* (Phase 3 adds worker threads for blocking offload only — workers never poll futures), `JoinHandle`s returning values, macro wrappers like `#[runtime::main]`/`block_on` sugar beyond `run()`.
 
@@ -56,6 +56,7 @@ edition = "2021"
 [dependencies]
 mio = { version = "0.8", features = ["os-poll", "net"] }  # default "log" kept on
 log = "0.4"
+reqwest = { version = "0.12", features = ["blocking"] }    # HTTP via spawn_blocking (Phase 3)
 
 [dev-dependencies]
 env_logger = "0.11"
@@ -75,7 +76,6 @@ src/
   timer_wheel.rs # ✓ done — TimerWheel, Sleep, YieldNow, free functions, thread-local helpers + 5 tests
   reactor.rs    # ✓ done — Reactor { poll, registry, next_token } + allocate_token(), dispatch(), register/deregister_source, thread-local with()
   io.rs         # ✓ done — Readable<T>, Writable<T>, read(), write(), Future/Drop impls + 6 tests
-  http.rs       # — Phase 2: HttpGetFuture (raw HTTP/1.1 GET over io::read/io::write)
   blocking.rs   # — Phase 3: WorkerPool, BlockingTask, spawn_blocking()
 tests/
   core.rs       # ✓ done — step 6's concurrency demo (the milestone test) lives here
@@ -396,12 +396,16 @@ Putting it together without macros (Phase 2 shape, note the `?` on `run()` per t
 fn main() -> io::Result<()> {
     let mut runtime = Runtime::new()?;
 
-    // Phase 2: custom HttpGetFuture over AsyncTcpStream (no reqwest, no tokio)
+    // Phase 3: HTTP GET via spawn_blocking (reqwest::blocking, no tokio dep)
     runtime.spawn(async {
-        match HttpGetFuture::get("httpbin.org/get").await {
-            Ok(response) => println!("response: {response}"),
-            Err(e) => eprintln!("http error: {e}"),
-        }
+        let body = spawn_blocking(|| {
+            reqwest::blocking::get("https://httpbin.org/get")
+                .unwrap()
+                .text()
+                .unwrap()
+        })
+        .await;
+        println!("response: {body}");
     });
 
     // Phase 3: read a local file offloaded to a worker thread
@@ -436,7 +440,7 @@ Each step is: **write the failing test → make it pass → refactor.** Tests li
 
 - **Step 8** — Reactor dispatch: register a `mio::net::UnixStream::pair()` as a test source, drive events through the token→waker registry, assert a write on one end wakes the task polling the other. (Real fds, no network, no server.) **done** — `reactor.rs` has `Reactor`, `allocate_token()`, `register()`/`deregister()`, `register_source()`/`deregister_source()`, `dispatch()`, and 6 unit tests.
 - **Step 9** — Generic I/O wrappers: `Readable<T>` / `Writable<T>` futures in `src/io.rs`. Any `mio::event::Source + Read`/`Write` — not TCP-specific. `WouldBlock` → register + store waker + `Pending`; data ready → deregister + `Ready`. `Drop` deregisters on cancellation (mirrors `Sleep`). Supersedes the original `AsyncTcpStream` plan. *Tests:* 6 tests covering read/write round-trip, coexisting pairs, the full reader+writer pipe, and partial-write waker storage. **done**
-- **Step 10** — `HttpGetFuture`: raw HTTP/1.1 GET over `io::read()`/`io::write()` — connects, sends the request, registers read interest, accumulates the response, returns the body on EOF. *Tests:* fetch from a real HTTP server (e.g. local `python3 -m http.server` or `httpbin.org`).
+- **Step 10** — HTTP via `reqwest::blocking`: removed custom `HttpFuture` in favor of `reqwest`'s blocking API, called through `spawn_blocking` (Phase 3). This keeps the crate tokio-free — `reqwest::blocking` manages its own internal runtime per-request. The demo shows both an HTTP GET and a file read offloaded to worker threads.
 - **Step 11** — Echo demo: concurrent reader task + writer task over the socket pair.
 
 ## Build Order — Phase 3 (`spawn_blocking` + workers, deferred)
