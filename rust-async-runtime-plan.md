@@ -14,12 +14,12 @@ To get a simple, single-threaded runtime working, you need **6 core components**
 - [x] **Step 6** — `mio::Poll` as the park primitive (`thread::sleep` → `self.poll.poll`; milestone test in `tests/core.rs`)
 - [x] **Step 7** — `Runtime::new()` → `io::Result<Runtime>` + no-unwrap audit (deferred by decision: `new()` keeps returning plain `Self`)
 
-**Phase 2 — reactor + I/O wrappers (in progress):**
+**Phase 2 — reactor + I/O wrappers (done):**
 
 - [x] **Step 8** — Reactor dispatch (token→waker registry, `park`, `dispatch`)
 - [x] **Step 9** — Generic `Readable<T>` / `Writable<T>` I/O futures (`src/io.rs`); supersedes the original `AsyncTcpStream` plan — works with any `mio::event::Source`
 - [x] **Step 10** — Replaced custom `HttpFuture` with `reqwest::blocking` (via `spawn_blocking`, Phase 3)
-- [ ] **Step 11** — Echo demo
+- [x] **Step 11** — Echo demo
 
 **Phase 3 — `spawn_blocking` (deferred):**
 
@@ -40,7 +40,7 @@ To get a simple, single-threaded runtime working, you need **6 core components**
     - total wall-clock time ≈ the *max* sleep duration (proves the executor parks instead of busy-looping or serializing);
     - the counter hit its expected value (proves tasks interleave and re-poll correctly, deterministically via yields);
     - `run()` returns cleanly with no tasks left in the queue, task map, or timer wheel.
-- **Phase 2 (partially done):** Reactor I/O dispatch + generic `Readable<T>`/`Writable<T>` futures (replaces the original `AsyncTcpStream` plan). Steps 8–9 complete; echo demo still deferred. Step 10 (`HttpFuture`) replaced with `reqwest::blocking` — HTTP is now a Phase 3 concern (uses `spawn_blocking`).
+- **Phase 2 (done):** Reactor I/O dispatch + generic `Readable<T>`/`Writable<T>` futures (replaces the original `AsyncTcpStream` plan). Steps 8–11 complete. Step 10 (`HttpFuture`) replaced with `reqwest::blocking` — HTTP is now a Phase 3 concern (uses `spawn_blocking`).
 - **Phase 3 (follow-up plan, deferred):** `spawn_blocking` + a worker pool — the escape hatch that makes **file reads** (and any blocking call) non-blocking by running them on worker threads (section 7).
 - **Deliberately excluded:** a multi-threaded *executor* (Phase 3 adds worker threads for blocking offload only — workers never poll futures), `JoinHandle`s returning values, macro wrappers like `#[runtime::main]`/`block_on` sugar beyond `run()`.
 
@@ -441,7 +441,7 @@ Each step is: **write the failing test → make it pass → refactor.** Tests li
 - **Step 8** — Reactor dispatch: register a `mio::net::UnixStream::pair()` as a test source, drive events through the token→waker registry, assert a write on one end wakes the task polling the other. (Real fds, no network, no server.) **done** — `reactor.rs` has `Reactor`, `allocate_token()`, `register()`/`deregister()`, `register_source()`/`deregister_source()`, `dispatch()`, and 6 unit tests.
 - **Step 9** — Generic I/O wrappers: `Readable<T>` / `Writable<T>` futures in `src/io.rs`. Any `mio::event::Source + Read`/`Write` — not TCP-specific. `WouldBlock` → register + store waker + `Pending`; data ready → deregister + `Ready`. `Drop` deregisters on cancellation (mirrors `Sleep`). Supersedes the original `AsyncTcpStream` plan. *Tests:* 6 tests covering read/write round-trip, coexisting pairs, the full reader+writer pipe, and partial-write waker storage. **done**
 - **Step 10** — HTTP via `reqwest::blocking`: removed custom `HttpFuture` in favor of `reqwest`'s blocking API, called through `spawn_blocking` (Phase 3). This keeps the crate tokio-free — `reqwest::blocking` manages its own internal runtime per-request. The demo shows both an HTTP GET and a file read offloaded to worker threads.
-- **Step 11** — Echo demo: concurrent reader task + writer task over the socket pair.
+- **Step 11** — Echo demo: Phase 2 milestone integration test in `tests/core.rs`. Two concurrent tasks exchange bytes over a `UnixStream::pair()` via the public `io::read` / `io::write` futures, all inside one `run()`. Proves the full reactor chain end-to-end from the user-facing API. **done**
 
 ## Build Order — Phase 3 (`spawn_blocking` + workers, deferred)
 
