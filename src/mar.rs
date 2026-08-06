@@ -49,7 +49,6 @@ impl Mar {
 
         context::install(context::ContextHandle {
             state: runtime.state.clone(),
-            reactor: runtime.reactor.clone(),
             wheel: runtime.wheel.clone(),
             job_tx: runtime.pool.job_tx(),
         });
@@ -263,7 +262,6 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
     let state = RuntimeState::new();
     context::install(context::ContextHandle {
         state: state.clone(),
-        reactor: Rc::new(RefCell::new(Reactor::new())),
         wheel: Rc::new(TimerHeap::new()),
         job_tx: pool.job_tx(),
     });

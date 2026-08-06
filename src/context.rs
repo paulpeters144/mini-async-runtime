@@ -2,14 +2,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
 
-use crate::reactor::ReactorHandle;
 use crate::runtime_state::RuntimeState;
 use crate::time::TimerHeap;
 use crate::task::worker_pool::Job;
 
 pub(crate) struct ContextHandle {
     pub state: Rc<RefCell<RuntimeState>>,
-    pub reactor: ReactorHandle,
     pub wheel: Rc<TimerHeap>,
     pub job_tx: mpsc::Sender<Job>,
 }
