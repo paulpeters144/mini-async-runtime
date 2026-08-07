@@ -46,9 +46,31 @@ Futures come in two flavors:
 
 **Leaf futures** are the primitives, futures that don't `.await` anything themselves. They are the bottom of the call tree. Examples: a `Sleep` future that talks directly to the timer heap, a socket read future that registers with the reactor, a `BlockingTask` that submits work to the worker pool. A leaf future returns `Pending` because it's waiting on something external (a timer, the OS, a thread), and stores the waker with that external thing.
 
-**Composed futures** are what you write with `async fn` or `async` blocks. They `.await` other futures (leaf or composed) and the compiler stitches them together into a state machine. When a composed future is polled, it polls the inner future it's awaiting. If the inner future returns `Pending`, the composed future also returns `Pending`, it's turtles all the way down until you hit a leaf future that actually registers a waker with an external system.
+**Composed futures** are what you write with `async fn` or `async` blocks. They `.await` other futures (leaf or composed), and the compiler stitches them together into a state machine. When a composed future is polled, it polls the inner future it's awaiting. If that returns `Pending`, the composed future returns `Pending` too, and this chain of `Pending` propagates all the way down until it reaches a leaf future that actually registers a waker with an external system.
 
-The runtime only cares about leaf futures. They're the ones that connect the async world to the outside world. Composed futures are just plumbing the compiler handles for you.
+Leaf futures connect the async world to the outside world. Composed futures are just plumbing between your code and the leaf futures.
+
+```mermaid
+flowchart TD
+    Root["Composed future<br/>(async fn, polls children)"]
+    A["Composed future<br/>(.await)"]
+    B["Composed future<br/>(.await)"]
+    L1["Leaf future<br/>(Sleep → timer heap)"]
+    L2["Leaf future<br/>(socket read → reactor)"]
+    L3["Leaf future<br/>(BlockingTask → worker pool)"]
+
+    Root --> A
+    Root --> B
+    A --> L1
+    B --> L2
+    B --> L3
+
+    style L1 fill:#e3f2fd
+    style L2 fill:#e3f2fd
+    style L3 fill:#e3f2fd
+```
+
+Here, every node is a future. The composed futures (plain) just poll their children; the leaf futures (shaded) are the ones that actually register a waker with an external system — a timer, the OS, or a thread.
 
 ---
 
