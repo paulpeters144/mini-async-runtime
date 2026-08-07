@@ -76,9 +76,7 @@ Here, every node is a future. The composed futures (plain) just poll their child
 
 ## 3. What does a runtime actually do?
 
-The runtime is the thing that calls `poll`. If leaf futures are the bridge to the outside world, the runtime is the engine that drives across it, polling futures, parking when nothing is ready, and waking up when something changes.
-
-To make this concrete, here is what the compiler does with an `async fn`:
+The runtime is what calls `poll`. If leaf futures are the bridge to the outside world, the runtime is the engine that keeps traffic moving: it polls futures, parks when nothing is ready, and wakes up when a waker fires.
 
 Here's a concrete example. You write this:
 
@@ -163,8 +161,6 @@ flowchart LR
     Executor -->|"sleep registers deadline"| Timer
     Executor -->|"spawn_blocking sends job"| Pool
 ```
-
-The executor is the hub. Everything else is a satellite that feeds tasks back into the executor when they're ready.
 
 ---
 
