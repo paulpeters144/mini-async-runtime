@@ -16,7 +16,6 @@ pub struct BlockingTask<R> {
     state: std::rc::Rc<std::cell::RefCell<RuntimeState>>,
     id: BlockingId,
     rx: Option<mpsc::Receiver<std::thread::Result<R>>>,
-    registered: bool,
     done: bool,
 }
 
@@ -36,15 +35,14 @@ impl<R> Future for BlockingTask<R> {
             unreachable!("BlockingTask polled after completion");
         }
 
-        if !this.registered {
-            this.state
-                .borrow_mut()
-                .blocking_wakers
-                .insert(this.id, cx.waker().clone());
-            this.registered = true;
-        } else if let Some(existing) = this.state.borrow_mut().blocking_wakers.get_mut(&this.id) {
-            existing.clone_from(cx.waker());
-        }
+        // First poll inserts the waker; later polls refresh it in place in
+        // case the task was re-scheduled with a different waker.
+        this.state
+            .borrow_mut()
+            .blocking_wakers
+            .entry(this.id)
+            .and_modify(|existing| existing.clone_from(cx.waker()))
+            .or_insert_with(|| cx.waker().clone());
 
         match this.rx.as_mut().unwrap().try_recv() {
             Ok(Ok(result)) => {
@@ -112,7 +110,6 @@ where
         state,
         id: task_id,
         rx: Some(rx),
-        registered: false,
         done: false,
     }
 }

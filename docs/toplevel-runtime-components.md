@@ -7,7 +7,7 @@ classDiagram
     direction LR
 
     class Executor {
-        +queue: VecDeque~usize~
+        +queue: Arc~Mutex~VecDeque~TaskId~~~
         +tasks: HashMap~usize, Task~
     }
 

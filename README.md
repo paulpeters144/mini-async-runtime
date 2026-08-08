@@ -232,7 +232,7 @@ Type erasure through `dyn Future` means the executor can hold many different fut
 ### The ready queue
 
 ```rust
-pub queue: VecDeque<usize>   // FIFO queue of task IDs
+pub queue: Arc<Mutex<VecDeque<TaskId>>>  // FIFO queue of task IDs
 pub tasks: HashMap<usize, Task>  // all live tasks
 ```
 
@@ -254,13 +254,13 @@ flowchart TD
 At the top of every loop iteration, the executor drains the ready queue:
 
 ```rust
-while let Some(id) = state.queue.pop_front() {
-    let mut task = state.tasks.remove(&id)?;
-    let waker = create_waker(state, id);
+while let Some(id) = state.queue.lock().unwrap().pop_front() {
+    let Some(mut task) = state.tasks.remove(&id) else { continue; };
+    let waker = task.waker().clone();
     let mut cx = Context::from_waker(&waker);
     match task.poll(&mut cx) {
         Poll::Pending => { state.tasks.insert(id, task); }
-        Poll::Ready(()) => { /* task is done, drop it */ }
+        Poll::Ready(()) => {}
     }
 }
 ```
@@ -269,14 +269,24 @@ Notice the task is *removed from the map* before polling and only *re-inserted* 
 
 ### The Waker
 
-The waker is how the executor gets notified that a parked task might be ready. It is a hand-built `RawWaker`, we don't use `Arc` because `mar` is single-threaded and `Rc` suffices:
+The waker is how the executor gets notified that a parked task might be ready. `mar` uses the standard library's `Wake` trait instead of hand-rolling a `RawWaker`:
 
 ```rust
-fn create_waker(state: Rc<RefCell<RuntimeState>>, id: usize) -> Waker {
-    // embed (state, id) into a raw pointer
-    // the vtable's `wake` function pushes `id` onto `state.queue`
+struct TaskWaker {
+    queue: Arc<Mutex<VecDeque<TaskId>>>,
+    id: TaskId,
+}
+
+impl Wake for TaskWaker {
+    fn wake(self: Arc<Self>) {
+        self.queue.lock().unwrap().push_back(self.id);
+    }
 }
 ```
+
+`Wake` is the safe, zero-`unsafe` way to build wakers. Implement it on an `Arc<Self>`, and the standard library generates the vtable, clone, `wake_by_ref`, and drop for free — no raw pointers, no hand-written reference-counting.
+
+The trade-off is that `Waker::from(Arc<T>)` requires `T: Send + Sync`, so the ready queue must live in an `Arc<Mutex<>>` instead of an `Rc<RefCell<>>`. The lock is always uncontended (the runtime is single-threaded), so `lock().unwrap()` is a trivial operation.
 
 When any component (timer, reactor, worker pool) calls `waker.wake()`, the task's ID is pushed onto the ready queue. The next time the executor reaches the top of the loop, it finds the task and polls it.
 
@@ -427,14 +437,8 @@ With parking, the thread blocks inside the OS kernel. The scheduler removes it f
 The timeout passed to `epoll_wait` is always driven by the timer heap. The event loop computes it right before calling `reactor.park()`:
 
 ```rust
-let timeout = time::next_deadline(&runtime.wheel).map(|deadline| {
-    let now = Instant::now();
-    if deadline > now {
-        deadline - now
-    } else {
-        Duration::ZERO
-    }
-});
+let timeout = time::next_deadline(&runtime.wheel)
+    .map(|deadline| deadline.saturating_duration_since(Instant::now()));
 ```
 
 - If no timers are pending and no I/O is registered, the timeout is `None` → the kernel blocks the thread forever until an event arrives.

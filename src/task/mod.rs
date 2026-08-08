@@ -19,12 +19,10 @@ impl Task {
         Task { id, waker, future }
     }
 
-    #[must_use]
     pub fn id(&self) -> TaskId {
         self.id
     }
 
-    #[must_use]
     pub fn waker(&self) -> &Waker {
         &self.waker
     }

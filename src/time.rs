@@ -68,9 +68,9 @@ impl TimerHeap {
 
     /// Remove an entry by id (used by `Sleep::Drop` for cancellation).
     pub(crate) fn remove(&self, target_id: usize) {
-        let mut entries: Vec<Reverse<TimerEntry>> = self.heap.borrow_mut().drain().collect();
-        entries.retain(|Reverse(entry)| entry.id != target_id);
-        self.heap.borrow_mut().extend(entries);
+        self.heap
+            .borrow_mut()
+            .retain(|Reverse(entry)| entry.id != target_id);
     }
 
     pub(crate) fn is_empty(&self) -> bool {

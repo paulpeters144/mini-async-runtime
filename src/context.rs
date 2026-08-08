@@ -21,7 +21,6 @@ thread_local! {
 /// context. Declare it after the runtime so it drops first, releasing the
 /// thread-local job sender before the pool joins its workers — on the happy
 /// path and on the panic path alike.
-#[must_use]
 pub(crate) struct ContextGuard;
 
 impl Drop for ContextGuard {

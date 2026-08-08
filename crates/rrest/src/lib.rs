@@ -19,7 +19,6 @@ pub type GetFuture<'a> =
 pub struct Rrest;
 
 impl Rrest {
-    #[must_use]
     pub fn get(url: &str) -> GetFuture<'_> {
         Box::pin(async move {
             let conn = net::connect(url)?;

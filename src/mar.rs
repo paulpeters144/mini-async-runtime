@@ -24,14 +24,14 @@ where
     state.next_id.0 += 1;
     let waker = create_waker(state.queue.clone(), id);
     state.tasks.insert(id, Task::new(id, future, waker));
-    state.queue.borrow_mut().push_back(id);
+    state.queue.lock().unwrap().push_back(id);
 }
 
 fn drain_ready_queue(runtime: &Mar) {
     loop {
         let next = {
             let state = runtime.state.borrow_mut();
-            state.queue.borrow_mut().pop_front()
+            state.queue.lock().unwrap().pop_front()
         };
         let Some(id) = next else {
             break;
@@ -64,14 +64,8 @@ fn poll_readiness_events(runtime: &mut Mar) -> io::Result<()> {
 }
 
 fn compute_timeout(wheel: &TimerHeap) -> Option<Duration> {
-    time::next_deadline(wheel).map(|deadline| {
-        let now = Instant::now();
-        if deadline > now {
-            deadline - now
-        } else {
-            Duration::ZERO
-        }
-    })
+    time::next_deadline(wheel)
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
 }
 
 fn fire_due_timers(runtime: &Mar) {
@@ -177,7 +171,7 @@ use std::thread;
 fn new_runtime_has_empty_queue_and_task_map() {
     let runtime = Mar::new();
     let state = runtime.state.borrow();
-    assert!(state.queue.borrow().is_empty());
+    assert!(state.queue.lock().unwrap().is_empty());
     assert!(state.tasks.is_empty());
     assert_eq!(state.next_id, TaskId(0));
 }

@@ -78,11 +78,7 @@ impl WorkerPool {
     /// the reactor wakes up on `WAKEN_TOKEN`, so it can wake only the
     /// blocking tasks that actually finished.
     pub(crate) fn drain_completed(&self) -> Vec<BlockingId> {
-        let mut ids = Vec::new();
-        while let Ok(id) = self.completed_rx.try_recv() {
-            ids.push(id);
-        }
-        ids
+        self.completed_rx.try_iter().collect()
     }
 
     /// Drop the job sender and join all workers. `Drop` delegates to this so

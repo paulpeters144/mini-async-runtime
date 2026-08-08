@@ -15,7 +15,7 @@ classDiagram
     }
 
     class RuntimeState {
-        queue: Rc~RefCell~VecDeque~TaskId~~~
+        queue: Arc~Mutex~VecDeque~TaskId~~~
         tasks: HashMap~TaskId, Task~
         next_id: TaskId
         blocking_wakers: HashMap~BlockingId, Waker~
@@ -35,8 +35,8 @@ classDiagram
         future: Pin~Box~dyn Future~Output=()~~~
     }
 
-    class Waker {
-        queue: Weak~RefCell~VecDeque~TaskId~~~
+    class TaskWaker {
+        queue: Arc~Mutex~VecDeque~TaskId~~~
         id: TaskId
     }
 
@@ -63,9 +63,9 @@ classDiagram
     ContextHandle --> RuntimeState
     ContextHandle --> TimerHeap
     RuntimeState --> Task : tasks
-    RuntimeState --> Waker : blocking_wakers
-    Task --> Waker : waker
-    Waker ..> RuntimeState : wake() pushes to shared ready queue
-    TimerHeap --> Waker : entry wakers
+    RuntimeState --> TaskWaker : blocking_wakers
+    Task --> TaskWaker : waker
+    TaskWaker ..> RuntimeState : wake() pushes to shared ready queue
+    TimerHeap --> TaskWaker : entry wakers
     WorkerPool --> Mar : wake() on job completion
 ```
