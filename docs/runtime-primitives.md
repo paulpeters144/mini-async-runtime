@@ -4,10 +4,17 @@ title: mar runtime — the runtime primitives
 
 ```mermaid
 classDiagram
-    direction TB
+    direction LR
+
+    class ContextHandle {
+        state: Rc~RefCell~RuntimeState~~
+        wheel: Rc~TimerRegistry~
+        job_tx: mpsc::Sender~Job~
+        completed_tx: mpsc::Sender~BlockingId~
+    }
 
     class RuntimeState {
-        queue: Arc~Mutex~Vec~TaskId~~
+        queue: ReadyQueue
         tasks: HashMap~TaskId, Task~
         next_id: TaskId
         blocking_wakers: HashMap~BlockingId, Waker~
@@ -17,19 +24,12 @@ classDiagram
     class Task {
         id: TaskId
         waker: Waker
-        future: Pin~Box~dyn Future~Output=()~~~
+        future: BoxedFuture
     }
 
     class TaskWaker {
-        queue: Arc~Mutex~Vec~TaskId~~
+        queue: ReadyQueue
         id: TaskId
-    }
-
-    class ContextHandle {
-        state: Rc~RefCell~RuntimeState~~
-        wheel: Rc~TimerRegistry~
-        job_tx: mpsc::Sender~Job~
-        completed_tx: mpsc::Sender~BlockingId~
     }
 
     ContextHandle --> RuntimeState
