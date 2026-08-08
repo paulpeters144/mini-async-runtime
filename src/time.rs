@@ -58,16 +58,17 @@ impl TimerHeap {
     pub(crate) fn push(&self, deadline: Instant, waker: Waker) -> usize {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
-        self.heap
-            .borrow_mut()
-            .push(Reverse(TimerEntry { deadline, id, waker }));
+        self.heap.borrow_mut().push(Reverse(TimerEntry {
+            deadline,
+            id,
+            waker,
+        }));
         id
     }
 
     /// Remove an entry by id (used by `Sleep::Drop` for cancellation).
     pub(crate) fn remove(&self, target_id: usize) {
-        let mut entries: Vec<Reverse<TimerEntry>> =
-            self.heap.borrow_mut().drain().collect();
+        let mut entries: Vec<Reverse<TimerEntry>> = self.heap.borrow_mut().drain().collect();
         entries.retain(|Reverse(entry)| entry.id != target_id);
         self.heap.borrow_mut().extend(entries);
     }
@@ -121,7 +122,9 @@ impl Future for Sleep {
 
 impl Drop for Sleep {
     fn drop(&mut self) {
-        if !self.done && let Some(id) = self.id {
+        if !self.done
+            && let Some(id) = self.id
+        {
             self.heap.remove(id);
         }
     }
@@ -134,7 +137,6 @@ impl Drop for Sleep {
 ///
 /// `sleep(Duration::ZERO)` is valid and completes immediately on the first
 /// poll without ever entering the heap.
-#[must_use]
 pub fn sleep(duration: Duration) -> Sleep {
     let heap = crate::context::with(|ctx| ctx.wheel.clone());
     Sleep {
@@ -147,7 +149,7 @@ pub fn sleep(duration: Duration) -> Sleep {
 
 /// Return the earliest deadline in the heap, if any.
 ///
-/// The executor uses this to compute its park timeout: `deadline - now`.
+/// The executor uses this to compute its poll timeout: `deadline - now`.
 /// When there are no pending timers the executor can block for a fixed
 /// fallback timeout or, once `mio::Poll` is wired in, block forever waiting
 /// for I/O.
@@ -158,7 +160,7 @@ pub(crate) fn next_deadline(heap: &TimerHeap) -> Option<Instant> {
 /// Pop every timer entry whose deadline has elapsed and wake the
 /// corresponding task via its stored waker.
 ///
-/// The executor calls this after parking. The waker's `wake_by_ref()` pushes
+/// The executor calls this after polling. The waker's `wake_by_ref()` pushes
 /// the task's id back onto the ready queue, so the task gets re-polled and
 /// its `Sleep` future sees `now >= deadline` and returns `Ready`.
 pub(crate) fn expire_due(heap: &TimerHeap) {
@@ -182,7 +184,7 @@ pub(crate) fn expire_due(heap: &TimerHeap) {
 mod tests {
     use super::*;
     use crate::mar::Mar;
-    use crate::runtime_state::RuntimeState;
+    use crate::runtime_state::{RuntimeState, TaskId};
     use crate::waker::create_waker;
     use std::cell::Cell;
     use std::task::Context;
@@ -208,7 +210,7 @@ mod tests {
         assert!(second.deadline <= third.deadline);
     }
 
-    // `sleep(Duration::ZERO)` completes immediately without ever parking: the
+    // `sleep(Duration::ZERO)` completes immediately without ever polling: the
     // first poll sees the deadline is already past and returns `Ready`. This is
     // the simplest integration test that proves the `Sleep` future is wired
     // into the executor correctly.
@@ -236,7 +238,7 @@ mod tests {
     fn dropped_sleep_removes_itself_from_heap() {
         let state = RuntimeState::new();
         let heap = Rc::new(TimerHeap::new());
-        let waker = create_waker(state.clone(), 1);
+        let waker = create_waker(state.borrow().queue.clone(), TaskId(1));
         let mut cx = Context::from_waker(&waker);
 
         let mut sleep_val = Sleep {

@@ -1,15 +1,21 @@
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
+use crate::runtime_state::BlockingId;
+
 pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// A fixed-size pool of worker threads that run blocking closures off the
 /// executor thread. Each worker holds a clone of the shared `mio::Waker` and
 /// calls `wake()` after every job, which lets the executor know a result is
-/// ready.
+/// ready. Completed blocking ids are routed through a dedicated channel so
+/// the executor can wake only the task that actually finished, instead of
+/// broadcasting to every registered blocking waker.
 pub struct WorkerPool {
     job_tx: Option<mpsc::Sender<Job>>,
     workers: Vec<JoinHandle<()>>,
+    completed_tx: mpsc::Sender<BlockingId>,
+    completed_rx: mpsc::Receiver<BlockingId>,
 }
 
 impl WorkerPool {
@@ -21,6 +27,7 @@ impl WorkerPool {
     /// Create a pool with `n` worker threads.
     pub fn with_count(waker: Arc<mio::Waker>, n: usize) -> Self {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
+        let (completed_tx, completed_rx) = mpsc::channel();
         let job_rx = Arc::new(Mutex::new(job_rx));
         let mut workers = Vec::with_capacity(n);
 
@@ -50,6 +57,8 @@ impl WorkerPool {
         WorkerPool {
             job_tx: Some(job_tx),
             workers,
+            completed_tx,
+            completed_rx,
         }
     }
 
@@ -58,16 +67,38 @@ impl WorkerPool {
     pub(crate) fn job_tx(&self) -> mpsc::Sender<Job> {
         self.job_tx.as_ref().expect("worker pool shut down").clone()
     }
-}
 
-impl Drop for WorkerPool {
-    fn drop(&mut self) {
-        // Drop the sender first to close the channel; workers exit their
-        // recv() loop when the channel disconnects.
+    /// Return a clone of the completed-id sender — installed into the thread-
+    /// local context so `spawn_blocking` can report which blocking id finished.
+    pub(crate) fn completed_tx(&self) -> mpsc::Sender<BlockingId> {
+        self.completed_tx.clone()
+    }
+
+    /// Drain all pending completed blocking ids. Called by the executor when
+    /// the reactor wakes up on `WAKEN_TOKEN`, so it can wake only the
+    /// blocking tasks that actually finished.
+    pub(crate) fn drain_completed(&self) -> Vec<BlockingId> {
+        let mut ids = Vec::new();
+        while let Ok(id) = self.completed_rx.try_recv() {
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Drop the job sender and join all workers. `Drop` delegates to this so
+    /// the teardown order (sender first, then workers) lives in one place.
+    /// Safe to call multiple times — draining makes the second run a no-op.
+    pub(crate) fn shutdown(&mut self) {
         drop(self.job_tx.take());
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

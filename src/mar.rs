@@ -10,10 +10,90 @@ use std::future::Future;
 use std::io::{self};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 const WAKEN_TOKEN: mio::Token = mio::Token(0);
+
+fn spawn_root<F>(runtime: &Mar, future: F)
+where
+    F: Future<Output = ()> + 'static,
+{
+    let mut state = runtime.state.borrow_mut();
+    let id = state.next_id;
+    state.next_id.0 += 1;
+    let waker = create_waker(state.queue.clone(), id);
+    state.tasks.insert(id, Task::new(id, future, waker));
+    state.queue.borrow_mut().push_back(id);
+}
+
+fn drain_ready_queue(runtime: &Mar) {
+    loop {
+        let next = {
+            let state = runtime.state.borrow_mut();
+            state.queue.borrow_mut().pop_front()
+        };
+        let Some(id) = next else {
+            break;
+        };
+
+        let Some(mut task) = runtime.state.borrow_mut().tasks.remove(&id) else {
+            continue;
+        };
+
+        let waker = task.waker().clone();
+        let mut cx = Context::from_waker(&waker);
+        match task.poll(&mut cx) {
+            Poll::Pending => {
+                runtime.state.borrow_mut().tasks.insert(id, task);
+            }
+            Poll::Ready(()) => {}
+        }
+    }
+}
+
+fn is_done(runtime: &Mar) -> bool {
+    let state = runtime.state.borrow();
+    state.tasks.is_empty() && runtime.wheel.is_empty() && state.blocking_wakers.is_empty()
+}
+
+fn poll_readiness_events(runtime: &mut Mar) -> io::Result<()> {
+    let timeout = compute_timeout(&runtime.wheel);
+    runtime.reactor.borrow_mut().poll(&mut runtime.events, timeout)?;
+    Ok(())
+}
+
+fn compute_timeout(wheel: &TimerHeap) -> Option<Duration> {
+    time::next_deadline(wheel).map(|deadline| {
+        let now = Instant::now();
+        if deadline > now {
+            deadline - now
+        } else {
+            Duration::ZERO
+        }
+    })
+}
+
+fn fire_due_timers(runtime: &Mar) {
+    time::expire_due(&runtime.wheel);
+}
+
+fn wake_completed_blocking(runtime: &Mar) {
+    for event in &runtime.events {
+        if event.token() == WAKEN_TOKEN {
+            let completed = runtime.pool.drain_completed();
+            for completed_id in completed {
+                let waker = {
+                    let state = runtime.state.borrow();
+                    state.blocking_wakers.get(&completed_id).cloned()
+                };
+                if let Some(w) = waker {
+                    w.wake_by_ref();
+                }
+            }
+        }
+    }
+}
 
 pub struct Mar {
     pub(crate) state: Rc<RefCell<RuntimeState>>,
@@ -29,8 +109,10 @@ impl Mar {
         let wheel = Rc::new(TimerHeap::new());
         let reactor = Rc::new(RefCell::new(Reactor::new()));
         let pool = {
-            let reactor_ref = reactor.borrow();
-            let waker = Arc::new(mio::Waker::new(reactor_ref.registry(), WAKEN_TOKEN).unwrap());
+            let reactor = reactor.borrow();
+            let registry = reactor.registry();
+            let waker = mio::Waker::new(registry, WAKEN_TOKEN);
+            let waker = Arc::new(waker.unwrap());
             WorkerPool::new(waker)
         };
         let events = mio::Events::with_capacity(64);
@@ -50,103 +132,36 @@ impl Mar {
     where
         F: Future<Output = ()> + 'static,
     {
-        // Panic safety: if a task poll panics (e.g. a blocking closure's
-        // payload is resumed inside `poll`), unwinding must still release the
-        // thread-local job sender. Otherwise `WorkerPool::drop` would block
-        // forever joining a worker whose channel never closed.
-        struct ContextGuard;
-        impl Drop for ContextGuard {
-            fn drop(&mut self) {
-                context::uninstall();
-            }
-        }
-
         let mut runtime = Self::new();
 
-        context::install(context::ContextHandle {
+        // The guard uninstalls the thread-local context when it drops, which
+        // happens before `runtime` drops — on the happy path and on a panic —
+        // so the pool can always join its workers.
+        let _context = context::install(context::ContextHandle {
             state: runtime.state.clone(),
             wheel: runtime.wheel.clone(),
             job_tx: runtime.pool.job_tx(),
+            completed_tx: runtime.pool.completed_tx(),
         });
-        let _guard = ContextGuard;
 
-        {
-            let mut state = runtime.state.borrow_mut();
-            let id = state.next_id;
-            state.next_id += 1;
-            state.tasks.insert(id, Task::new(id, future));
-            state.queue.push_back(id);
-        }
+        spawn_root(&runtime, future);
 
         loop {
-            loop {
-                let next = {
-                    let mut state = runtime.state.borrow_mut();
-                    state.queue.pop_front()
-                };
-                let Some(id) = next else {
-                    break;
-                };
+            drain_ready_queue(&runtime);
 
-                let Some(mut task) = runtime.state.borrow_mut().tasks.remove(&id) else {
-                    continue;
-                };
-
-                let waker = create_waker(runtime.state.clone(), id);
-                let mut cx = Context::from_waker(&waker);
-                match task.poll(&mut cx) {
-                    Poll::Pending => {
-                        runtime.state.borrow_mut().tasks.insert(id, task);
-                    }
-                    Poll::Ready(()) => {}
-                }
-            }
-
-            let done = {
-                let state = runtime.state.borrow();
-                state.tasks.is_empty()
-                    && runtime.wheel.is_empty()
-                    && state.blocking_wakers.is_empty()
-            };
-            if done {
+            if is_done(&runtime) {
                 return Ok(());
             }
 
-            let timeout = time::next_deadline(&runtime.wheel).map(|deadline| {
-                let now = Instant::now();
-                if deadline > now {
-                    deadline - now
-                } else {
-                    Duration::ZERO
-                }
-            });
-            runtime
-                .reactor
-                .borrow_mut()
-                .park(&mut runtime.events, timeout)?;
-
-            time::expire_due(&runtime.wheel);
-
-            for event in &runtime.events {
-                if event.token() == WAKEN_TOKEN {
-                    // Collect first, then wake: `wake_by_ref` pushes the task
-                    // id onto the queue — a `borrow_mut` on `state` — so the
-                    // immutable borrow used for iteration must be released
-                    // before any waker fires, or the RefCell double-borrows
-                    // and panics.
-                    let wakers: Vec<Waker> = {
-                        let state = runtime.state.borrow();
-                        state.blocking_wakers.values().cloned().collect()
-                    };
-                    for waker in &wakers {
-                        waker.wake_by_ref();
-                    }
-                }
-            }
+            poll_readiness_events(&mut runtime)?;
+            fire_due_timers(&runtime);
+            wake_completed_blocking(&runtime);
         }
     }
 }
 
+#[cfg(test)]
+use crate::runtime_state::TaskId;
 #[cfg(test)]
 use std::cell::Cell;
 #[cfg(test)]
@@ -162,9 +177,9 @@ use std::thread;
 fn new_runtime_has_empty_queue_and_task_map() {
     let runtime = Mar::new();
     let state = runtime.state.borrow();
-    assert!(state.queue.is_empty());
+    assert!(state.queue.borrow().is_empty());
     assert!(state.tasks.is_empty());
-    assert_eq!(state.next_id, 0);
+    assert_eq!(state.next_id, TaskId(0));
 }
 
 // An empty future completes on its first poll, so `run(async {})` returns
@@ -249,7 +264,7 @@ fn spawn_blocking_smoke() {
 // Phase 3 Drop test: a BlockingTask dropped before completion removes its
 // entry from `RuntimeState::blocking_wakers`. If it did not, the executor's
 // termination check (`blocking_wakers.is_empty()`) would never pass and `run()`
-// would park forever. Runs against a hand-installed runtime handle so the
+// would poll forever. Runs against a hand-installed runtime handle so the
 // blocking_wakers map can be inspected directly.
 #[test]
 fn dropped_spawn_blocking_leaves_blocking_map_empty() {
@@ -257,10 +272,11 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
     let waker = Arc::new(mio::Waker::new(poll.registry(), WAKEN_TOKEN).unwrap());
     let worker_pool = WorkerPool::new(waker);
     let state = RuntimeState::new();
-    context::install(context::ContextHandle {
+    let _context = context::install(context::ContextHandle {
         state: state.clone(),
         wheel: Rc::new(TimerHeap::new()),
         job_tx: worker_pool.job_tx(),
+        completed_tx: worker_pool.completed_tx(),
     });
 
     let fut = crate::task::spawn_blocking(|| {
@@ -270,15 +286,13 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
     let id = fut.id();
     let mut fut = Box::pin(fut);
 
-    let waker = create_waker(state.clone(), id);
+    let waker = create_waker(state.borrow().queue.clone(), TaskId(999));
     let mut cx = Context::from_waker(&waker);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
     assert!(state.borrow().blocking_wakers.contains_key(&id));
 
     drop(fut);
     assert!(state.borrow().blocking_wakers.is_empty());
-
-    context::uninstall();
 }
 
 // Step 15 — shutdown: `run()` drops the Mar when it returns, which closes
@@ -292,5 +306,22 @@ fn runtime_drop_joins_workers_promptly_after_run() {
         let _result = crate::task::spawn_blocking(|| 21 * 2).await;
     })
     .expect("run should not fail");
+    assert!(start.elapsed() < Duration::from_millis(500));
+}
+
+// A panicking root future still joins workers: the unwind drops the guard,
+// which uninstalls the thread-local context, then drops `Mar`, and the pool
+// joins its workers. The panic propagates to the caller intact.
+#[test]
+fn panicking_root_future_still_joins_workers() {
+    let start = Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Mar::run(async move {
+            let _job = crate::task::spawn_blocking(|| 21 * 2);
+            panic!("root future exploded");
+        })
+        .expect("run should not fail");
+    }));
+    assert!(result.is_err());
     assert!(start.elapsed() < Duration::from_millis(500));
 }

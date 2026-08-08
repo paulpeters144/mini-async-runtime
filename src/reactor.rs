@@ -19,7 +19,7 @@ impl Reactor {
         self.poll.registry()
     }
 
-    pub fn park(
+    pub fn poll(
         &mut self,
         events: &mut mio::Events,
         timeout: Option<Duration>,

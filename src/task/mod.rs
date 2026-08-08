@@ -2,27 +2,31 @@ pub mod all;
 pub mod blocking;
 pub(crate) mod worker_pool;
 
+use crate::runtime_state::TaskId;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
-
-#[cfg(test)]
-use std::task::Waker;
+use std::task::{Context, Poll, Waker};
 
 pub struct Task {
-    id: usize,
+    id: TaskId,
+    waker: Waker,
     future: Pin<Box<dyn Future<Output = ()>>>,
 }
 
 impl Task {
-    pub fn new(id: usize, f: impl Future<Output = ()> + 'static) -> Self {
+    pub fn new(id: TaskId, f: impl Future<Output = ()> + 'static, waker: Waker) -> Self {
         let future = Box::pin(f);
-        Task { id, future }
+        Task { id, waker, future }
     }
 
     #[must_use]
-    pub fn id(&self) -> usize {
+    pub fn id(&self) -> TaskId {
         self.id
+    }
+
+    #[must_use]
+    pub fn waker(&self) -> &Waker {
+        &self.waker
     }
 
     pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
@@ -34,9 +38,9 @@ pub use all::all;
 pub use blocking::spawn_blocking;
 
 // A `Task` is the unit of work the executor owns: an id the waker uses to
-// reach it, plus the future itself. They check the two promises a task makes
-// to the executor: I can be polled" and "I remember where I left off between
-// polls".
+// reach it, plus the waker itself and the future. They check the two promises a
+// task makes to the executor: "I can be polled" and "I remember where I left off
+// between polls".
 
 // Why `Box::pin`? Two separate problems solved at once.
 //   - Box: the future lives on the heap, so a `Task` is always a small, fixed
@@ -62,18 +66,21 @@ fn new_wraps_future_with_id() {
 
     #[allow(clippy::large_stack_arrays)]
     let huge_data = Box::new([0; 64 * 1024]);
-    let task = Task::new(7, HugeFuture(huge_data));
+    let task = Task::new(TaskId(7), HugeFuture(huge_data), Waker::noop().clone());
 
-    assert_eq!(task.id(), 7);
+    assert_eq!(task.id(), TaskId(7));
 
-    // A `Task` holds only an id and the future. The future is a trait object
+    // A `Task` holds an id, a waker, and the future. The future is a trait object
     // behind a `Box`, and a trait object is a *fat* pointer: a data pointer
-    // plus a vtable pointer. So the size adds up as:
+    // plus a vtable pointer. A `Waker` is a *fat* pointer too (RawWaker carries
+    // a data pointer and a vtable pointer). So the size adds up as:
     let word = std::mem::size_of::<usize>();
-    let data_ptr = word; // the Box's pointer to the heap allocation
-    let vtable_ptr = word; // the vtable needed to call `Future::poll`
-    let id = word; // the task's id
-    let expected = data_ptr + vtable_ptr + id;
+    let data_ptr = word;
+    let vtable_ptr = word;
+    let id = word;
+    let waker_ptr = word;
+    let waker_vptr = word;
+    let expected = data_ptr + vtable_ptr + id + waker_ptr + waker_vptr;
     assert_eq!(std::mem::size_of::<Task>(), expected);
 }
 
@@ -84,7 +91,7 @@ fn new_wraps_future_with_id() {
 fn poll_returns_ready_when_future_completes() {
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
-    let mut task = Task::new(0, async {});
+    let mut task = Task::new(TaskId(0), async {}, Waker::noop().clone());
 
     assert_eq!(task.poll(&mut cx), Poll::Ready(()));
 }
@@ -121,7 +128,7 @@ impl Future for PollTwice {
 fn pending_then_ready_resumes_across_polls() {
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
-    let mut task = Task::new(0, PollTwice { polled: 0 });
+    let mut task = Task::new(TaskId(0), PollTwice { polled: 0 }, Waker::noop().clone());
 
     // First poll: "not ready yet". The task keeps the future for later.
     assert_eq!(task.poll(&mut cx), Poll::Pending);

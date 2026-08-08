@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::task::{Context, Poll};
 
 use crate::context;
-use crate::runtime_state::RuntimeState;
+use crate::runtime_state::{BlockingId, RuntimeState};
 use crate::task::worker_pool::Job;
 
 // ---------------------------------------------------------------------------
@@ -14,7 +14,7 @@ use crate::task::worker_pool::Job;
 
 pub struct BlockingTask<R> {
     state: std::rc::Rc<std::cell::RefCell<RuntimeState>>,
-    id: usize,
+    id: BlockingId,
     rx: Option<mpsc::Receiver<std::thread::Result<R>>>,
     registered: bool,
     done: bool,
@@ -22,7 +22,7 @@ pub struct BlockingTask<R> {
 
 #[cfg(test)]
 impl<R> BlockingTask<R> {
-    pub(crate) fn id(&self) -> usize {
+    pub(crate) fn id(&self) -> BlockingId {
         self.id
     }
 }
@@ -85,24 +85,27 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let (state, job_tx) = context::with(|ctx| {
-        (ctx.state.clone(), ctx.job_tx.clone())
+    let (state, job_tx, completed_tx) = context::with(|ctx| {
+        (ctx.state.clone(), ctx.job_tx.clone(), ctx.completed_tx.clone())
     });
 
     let task_id = {
         let mut state = state.borrow_mut();
         let id = state.next_blocking_id;
-        state.next_blocking_id += 1;
+        state.next_blocking_id.0 += 1;
         id
     };
 
     // The result channel carries the closure's outcome — value OR panic
     // payload — so a panicking closure never vanishes silently: the payload
     // is resumed on the executor thread when the BlockingTask is re-polled.
+    // The completed channel lets the executor know exactly which blocking
+    // task finished, avoiding a broadcast wake of all blocking wakers.
     let (tx, rx) = mpsc::channel::<std::thread::Result<R>>();
     let job: Job = Box::new(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         let _ = tx.send(result);
+        let _ = completed_tx.send(task_id);
     });
     job_tx.send(job).expect("worker pool is shut down");
     BlockingTask {
