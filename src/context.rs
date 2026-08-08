@@ -3,12 +3,12 @@ use std::rc::Rc;
 use std::sync::mpsc;
 
 use crate::runtime_state::{BlockingId, RuntimeState};
-use crate::time::TimerHeap;
 use crate::task::worker_pool::Job;
+use crate::time::TimerRegistry;
 
 pub(crate) struct ContextHandle {
     pub state: Rc<RefCell<RuntimeState>>,
-    pub wheel: Rc<TimerHeap>,
+    pub wheel: Rc<TimerRegistry>,
     pub job_tx: mpsc::Sender<Job>,
     pub completed_tx: mpsc::Sender<BlockingId>,
 }
@@ -42,9 +42,5 @@ pub(crate) fn with<F, R>(f: F) -> R
 where
     F: FnOnce(&ContextHandle) -> R,
 {
-    CONTEXT.with(|c| {
-        f(c.borrow()
-            .as_ref()
-            .expect("runtime context not installed"))
-    })
+    CONTEXT.with(|c| f(c.borrow().as_ref().expect("runtime context not installed")))
 }

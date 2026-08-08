@@ -4,10 +4,10 @@ use mar::Mar;
 use mar::time::sleep;
 
 // The simplest possible runtime program: a stopwatch that counts down. Each
-// `sleep` blocks the executor on the timer heap; the loop wakes every second,
-// prints the remaining time, and keeps going until zero.
+// `sleep` blocks the executor on the timer registry; the loop wakes every
+// second, prints the remaining time, and keeps going until zero.
 //
-// This example uses ONLY the timer heap — no blocking work, no I/O.
+// This example uses ONLY the timer registry — no blocking work, no I/O.
 fn main() {
     Mar::run(async move {
         let seconds = 5;

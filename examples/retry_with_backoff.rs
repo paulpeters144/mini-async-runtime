@@ -6,7 +6,7 @@ use mar::time::sleep;
 
 // A job that may fail (here: the first two attempts fail, then it succeeds),
 // retried with exponential backoff. Each attempt runs on the worker pool; the
-// backoff wait blocks the executor on the timer heap between attempts.
+// backoff wait blocks the executor on the timer registry between attempts.
 fn main() {
     Mar::run(async move {
         let mut attempt = 0;

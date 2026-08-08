@@ -3,7 +3,7 @@ use crate::reactor::{Reactor, ReactorHandle};
 use crate::runtime_state::RuntimeState;
 use crate::task::Task;
 use crate::task::worker_pool::WorkerPool;
-use crate::time::{self, TimerHeap};
+use crate::time::TimerRegistry;
 use crate::waker::create_waker;
 use std::cell::RefCell;
 use std::future::Future;
@@ -59,17 +59,21 @@ fn is_done(runtime: &Mar) -> bool {
 
 fn poll_readiness_events(runtime: &mut Mar) -> io::Result<()> {
     let timeout = compute_timeout(&runtime.wheel);
-    runtime.reactor.borrow_mut().poll(&mut runtime.events, timeout)?;
+    runtime
+        .reactor
+        .borrow_mut()
+        .poll(&mut runtime.events, timeout)?;
     Ok(())
 }
 
-fn compute_timeout(wheel: &TimerHeap) -> Option<Duration> {
-    time::next_deadline(wheel)
+fn compute_timeout(wheel: &TimerRegistry) -> Option<Duration> {
+    wheel
+        .next_deadline()
         .map(|deadline| deadline.saturating_duration_since(Instant::now()))
 }
 
 fn fire_due_timers(runtime: &Mar) {
-    time::expire_due(&runtime.wheel);
+    runtime.wheel.expire_due();
 }
 
 fn wake_completed_blocking(runtime: &Mar) {
@@ -91,7 +95,7 @@ fn wake_completed_blocking(runtime: &Mar) {
 
 pub struct Mar {
     pub(crate) state: Rc<RefCell<RuntimeState>>,
-    pub(crate) wheel: Rc<TimerHeap>,
+    pub(crate) wheel: Rc<TimerRegistry>,
     pub(crate) reactor: ReactorHandle,
     pub(crate) pool: WorkerPool,
     events: mio::Events,
@@ -100,7 +104,7 @@ pub struct Mar {
 impl Mar {
     pub(crate) fn new() -> Self {
         let state = RuntimeState::new();
-        let wheel = Rc::new(TimerHeap::new());
+        let wheel = Rc::new(TimerRegistry::new());
         let reactor = Rc::new(RefCell::new(Reactor::new()));
         let pool = {
             let reactor = reactor.borrow();
@@ -268,7 +272,7 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
     let state = RuntimeState::new();
     let _context = context::install(context::ContextHandle {
         state: state.clone(),
-        wheel: Rc::new(TimerHeap::new()),
+        wheel: Rc::new(TimerRegistry::new()),
         job_tx: worker_pool.job_tx(),
         completed_tx: worker_pool.completed_tx(),
     });

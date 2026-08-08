@@ -27,7 +27,7 @@ fn spawn_blocking_interleaves_with_timer() {
             });
 
             // Worker is already running the 200ms closure. Park on the
-            // timer heap for 50ms while the worker keeps ticking.
+            // timer registry for 50ms while the worker keeps ticking.
             sleep(Duration::from_millis(50)).await;
             timer_fired.set(true);
 

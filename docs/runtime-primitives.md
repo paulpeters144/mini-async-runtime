@@ -8,7 +8,7 @@ classDiagram
 
     class Mar {
         state: Rc~RefCell~RuntimeState~~
-        wheel: Rc~TimerHeap~
+        wheel: Rc~TimerRegistry~
         reactor: Rc~RefCell~Reactor~
         pool: WorkerPool
         events: mio::Events
@@ -24,7 +24,7 @@ classDiagram
 
     class ContextHandle {
         state: Rc~RefCell~RuntimeState~~
-        wheel: Rc~TimerHeap~
+        wheel: Rc~TimerRegistry~
         job_tx: Sender~Job~
         completed_tx: Sender~BlockingId~
     }
@@ -40,8 +40,8 @@ classDiagram
         id: TaskId
     }
 
-    class TimerHeap {
-        heap: RefCell~BinaryHeap~Reverse~TimerEntry~~~
+    class TimerRegistry {
+        entries: RefCell~Vec~TimerEntry~~
         next_id: Cell~usize~
     }
 
@@ -57,15 +57,15 @@ classDiagram
     }
 
     Mar --> RuntimeState
-    Mar --> TimerHeap
+    Mar --> TimerRegistry
     Mar --> Reactor
     Mar --> WorkerPool
     ContextHandle --> RuntimeState
-    ContextHandle --> TimerHeap
+    ContextHandle --> TimerRegistry
     RuntimeState --> Task : tasks
     RuntimeState --> TaskWaker : blocking_wakers
     Task --> TaskWaker : waker
     TaskWaker ..> RuntimeState : wake() pushes to shared ready queue
-    TimerHeap --> TaskWaker : entry wakers
+    TimerRegistry --> TaskWaker : entry wakers
     WorkerPool --> Mar : wake() on job completion
 ```

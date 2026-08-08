@@ -84,7 +84,11 @@ where
     R: Send + 'static,
 {
     let (state, job_tx, completed_tx) = context::with(|ctx| {
-        (ctx.state.clone(), ctx.job_tx.clone(), ctx.completed_tx.clone())
+        (
+            ctx.state.clone(),
+            ctx.job_tx.clone(),
+            ctx.completed_tx.clone(),
+        )
     });
 
     let task_id = {

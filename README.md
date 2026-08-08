@@ -8,7 +8,7 @@ Rust's language-level `async/await` gives you syntax for writing futures and pau
 
 This means Rust developers who want to use `async`/`await` either have to build their own runtime or use one built by someone else. The ecosystem offers plenty of options: **tokio**, the de facto standard used by most production projects; **async-std**, which mirrors the standard library's own API; **smol**, a deliberately small and embedded-friendly runtime; and **embassy**, which targets microcontrollers without an OS. These runtimes are powerful and battle-tested, but they are also notoriously hard to wrap your head around. Their codebases span tens of thousands of lines, much of it focused on optimizations beyond the fundamentals: work-stealing schedulers, I/O drivers, slab allocators, async synchronization primitives, and cancellation safety, to name a few. Reading tokio's source is reading years of performance optimizations and niche features that obfuscate what is actually needed for an async runtime.
 
-`mar` attempts to be the opposite: a small runtime that genuinely executes async Rust. A few hundred lines, single-threaded at its core, and completely macro-free, with every piece of boilerplate written out so that it's visible and learnable rather than hidden behind ergonomic abstractions. No optimization you can't see through, and every component — the executor, reactor, timer heap, and worker pool — is reduced to its bare minimum.
+`mar` attempts to be the opposite: a small runtime that genuinely executes async Rust. A few hundred lines, single-threaded at its core, and completely macro-free, with every piece of boilerplate written out so that it's visible and learnable rather than hidden behind ergonomic abstractions. No optimization you can't see through, and every component — the executor, reactor, timer registry, and worker pool — is reduced to its bare minimum.
 
 ```mermaid
 flowchart TD
@@ -44,7 +44,7 @@ The `Context` carries a `Waker`, the mechanism a future uses to tell the executo
 
 Futures come in two flavors:
 
-**Leaf futures** are the primitives, futures that don't `.await` anything themselves. They are the bottom of the call tree. Examples: a `Sleep` future that talks directly to the timer heap, a socket read future that registers with the reactor, a `BlockingTask` that submits work to the worker pool. A leaf future returns `Pending` because it's waiting on something external (a timer, the OS, a thread), and stores the waker with that external thing.
+**Leaf futures** are the primitives, futures that don't `.await` anything themselves. They are the bottom of the call tree. Examples: a `Sleep` future that talks directly to the timer registry, a socket read future that registers with the reactor, a `BlockingTask` that submits work to the worker pool. A leaf future returns `Pending` because it's waiting on something external (a timer, the OS, a thread), and stores the waker with that external thing.
 
 **Composed futures** are what you write with `async fn` or `async` blocks. They `.await` other futures (leaf or composed), and the compiler stitches them together into a state machine. When a composed future is polled, it polls the inner future it's awaiting. If that returns `Pending`, the composed future returns `Pending` too, and this chain of `Pending` propagates all the way down until it reaches a leaf future that actually registers a waker with an external system.
 
@@ -55,7 +55,7 @@ flowchart TD
     Root["Composed future<br/>(async fn, polls children)"]
     A["Composed future<br/>(.await)"]
     B["Composed future<br/>(.await)"]
-    L1["Leaf future<br/>(Sleep → timer heap)"]
+    L1["Leaf future<br/>(Sleep → timer registry)"]
     L2["Leaf future<br/>(socket read → reactor)"]
     L3["Leaf future<br/>(BlockingTask → worker pool)"]
 
@@ -143,14 +143,14 @@ To do this, a runtime needs three things:
 
 4. **A worker pool:** a small set of background threads for work that would block the main async thread (heavy computation, synchronous file I/O).
 
-These four pieces share one critical mechanism: the **Waker**. When a future returns `Pending`, it stores a `Waker` somewhere (in the timer heap, in the reactor's event registry, in the worker pool's completion queue). Later, when the thing the future was waiting for becomes ready, the waker fires, pushing the future's task back onto the executor's ready queue so it gets polled again.
+These four pieces share one critical mechanism: the **Waker**. When a future returns `Pending`, it stores a `Waker` somewhere (in the timer registry, in the reactor's event registry, in the worker pool's completion queue). Later, when the thing the future was waiting for becomes ready, the waker fires, pushing the future's task back onto the executor's ready queue so it gets polled again.
 
 ```mermaid
 flowchart LR
     subgraph Runtime
         Executor["Executor<br/>(polls futures)"]
         Reactor["Reactor<br/>(parks thread)"]
-        Timer["Timer Heap<br/>(tracks deadlines)"]
+        Timer["Timer Registry<br/>(tracks deadlines)"]
         Pool["Worker Pool<br/>(blocking work)"]
     end
 
@@ -179,7 +179,7 @@ Mar::run(root_future):
             if it returns Ready: discard it
             if it returns Pending: set it aside (it will re-enter the queue when woken)
 
-        if no tasks live anywhere (ready queue, timer heap, blocking pool):
+        if no tasks live anywhere (ready queue, timer registry, blocking pool):
             break   // all work is done
 
         compute the earliest timer deadline
@@ -296,22 +296,22 @@ When any component (timer, reactor, worker pool) calls `waker.wake()`, the task'
 
 Async code cannot call `std::thread::sleep()`. Doing so would block the single OS thread and freeze the entire runtime. Instead, `sleep()` in async code means: *park this task and wake me up after at least this much time has passed*.
 
-### The timer heap
+### The timer registry
 
-`mar` uses a min-heap (`BinaryHeap<Reverse<TimerEntry>>`) to track deadlines:
+`mar` uses a plain list (`Vec<TimerEntry>`) to track deadlines:
 
 ```
 TimerEntry { deadline: Instant, id: usize, waker: Waker }
 ```
 
-The entry with the **earliest** deadline sits at the top of the heap. Each entry stores a `Waker` alongside its deadline. When the deadline expires, the heap pops the entry and calls `waker.wake()` to push the task back onto the ready queue.
+When the executor needs the earliest deadline it scans the list. Each entry stores a `Waker` alongside its deadline. When the deadline expires, the entry is removed from the list and `waker.wake()` pushes the task back onto the ready queue.
 
 ### How sleep() works
 
 When you call `time::sleep(duration)`, you get a `Sleep` future. On its first poll:
 
 1. If the deadline is already in the past, it returns `Ready` immediately.
-2. If the deadline is in the future, it pushes `(deadline, waker)` into the timer heap and returns `Pending`.
+2. If the deadline is in the future, it pushes `(deadline, waker)` into the timer registry and returns `Pending`.
 
 The waker it pushes is the one from the `Context` it was polled with, meaning it's the waker for the task that called `sleep`. When the timer fires, that task gets re-queued, gets polled again, and the `Sleep` future returns `Ready`.
 
@@ -319,7 +319,7 @@ The waker it pushes is the one from the `Context` it was polled with, meaning it
 sequenceDiagram
     participant T as Task (your code)
     participant S as Sleep future
-    participant H as TimerHeap
+    participant H as TimerRegistry
     participant E as Executor
     participant R as Reactor
 
@@ -349,7 +349,7 @@ sequenceDiagram
 
 ### Integration with the reactor
 
-The timer heap doesn't run on its own thread. It's checked in two places:
+The timer registry doesn't run on its own thread. It's checked in two places:
 
 1. **Before parking:** the executor calls `next_deadline()` to get the earliest timer deadline. This becomes the reactor's park timeout. If the earliest timer is 500ms away, the reactor parks for at most 500ms, the OS will wake the thread when that time passes.
 
@@ -434,10 +434,10 @@ With parking, the thread blocks inside the OS kernel. The scheduler removes it f
 
 ### The timeout
 
-The timeout passed to `epoll_wait` is always driven by the timer heap. The event loop computes it right before calling `reactor.park()`:
+The timeout passed to `epoll_wait` is always driven by the timer registry. The event loop computes it right before calling `reactor.park()`:
 
 ```rust
-let timeout = time::next_deadline(&runtime.wheel)
+let timeout = runtime.wheel.next_deadline()
     .map(|deadline| deadline.saturating_duration_since(Instant::now()));
 ```
 
@@ -503,7 +503,7 @@ sequenceDiagram
     participant User as User Code
     participant Mar as Mar::run()
     participant Exec as Executor
-    participant Timer as TimerHeap
+    participant Timer as TimerRegistry
     participant Reactor as Reactor (epoll)
 
     User->>Mar: run(async { sleep(1s).await })
@@ -533,7 +533,7 @@ sequenceDiagram
         Exec-->>User: Ready(())
     end
 
-    Note over Exec: All tasks done, timer heap empty
+    Note over Exec: All tasks done, timer registry empty
     Mar-->>User: Ok(())
 ```
 
@@ -552,7 +552,7 @@ flowchart TD
     end
 
     subgraph Drivers["Drivers (each feeds wakers back to Ready Queue)"]
-        Timer["TimerHeap<br/>(deadlines)"]
+        Timer["TimerRegistry<br/>(deadlines)"]
         Reactor["Reactor<br/>(epoll/kqueue)"]
         Pool["WorkerPool<br/>(blocking work)"]
     end
@@ -574,7 +574,7 @@ flowchart TD
 
 At every level, the pattern is the same: **a task yields by returning `Pending` and storing its `Waker` somewhere. Later, when the condition it was waiting for becomes true, the waker fires, the task goes back into the ready queue, and it gets polled again.**
 
-- For `sleep()`: waker goes in the timer heap. Fires when the deadline expires.
+- For `sleep()`: waker goes in the timer registry. Fires when the deadline expires.
 - For I/O: waker goes in the reactor's event registry. Fires when the socket is ready.
 - For `spawn_blocking()`: waker goes in `blocking_wakers`. Fires when a worker thread finishes the job.
 
@@ -586,7 +586,7 @@ The executor doesn't know or care *why* a task returned `Pending`. It trusts the
 
 `mar` is intentionally minimal. Every feature omitted is a deliberate choice to keep the codebase small enough to hold in your head. Here's what you won't find:
 
-**No multi-threaded executor.** `mar` runs everything on one OS thread. There is one ready queue, one reactor, one timer heap. Adding multiple event loops with work-stealing would roughly double the line count and obscure the core concepts.
+**No multi-threaded executor.** `mar` runs everything on one OS thread. There is one ready queue, one reactor, one timer registry. Adding multiple event loops with work-stealing would roughly double the line count and obscure the core concepts.
 
 **No work-stealing.** Even in a multi-threaded setup, who decides which thread polls which task? Tokio uses work-stealing, idle threads grab tasks from busy threads' queues. This is an optimization, not a prerequisite for understanding async runtimes.
 

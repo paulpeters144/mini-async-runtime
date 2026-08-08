@@ -15,8 +15,8 @@ classDiagram
         +poll: mio Poll
     }
 
-    class Timer {
-        +heap: BinaryHeap~TimerEntry~
+    class TimerRegistry {
+        +entries: Vec~TimerEntry~
         +next_id: usize
     }
 
@@ -26,6 +26,6 @@ classDiagram
     }
 
     Executor --> Reactor : parks + wakes
-    Executor --> Timer : checks deadlines
+    Executor --> TimerRegistry : checks deadlines
     Executor --> WorkerPool : offloads blocking work
 ```

@@ -45,8 +45,7 @@ impl<F: Future, const N: usize> Future for JoinAll<F, N> {
     }
 }
 
-pub fn all<F: Future, const N: usize>(futures: [F; N]) -> JoinAll<F, N>
-{
+pub fn all<F: Future, const N: usize>(futures: [F; N]) -> JoinAll<F, N> {
     JoinAll::new(futures)
 }
 
@@ -98,10 +97,7 @@ mod tests {
         let mut join = JoinAll::new([OnceReady(Some(42u32))]);
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
-        assert_eq!(
-            Pin::new(&mut join).poll(&mut cx),
-            Poll::Ready([42])
-        );
+        assert_eq!(Pin::new(&mut join).poll(&mut cx), Poll::Ready([42]));
     }
 
     #[test]
@@ -109,10 +105,7 @@ mod tests {
         let mut join = JoinAll::<AlwaysPending, 0>::new([]);
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
-        assert_eq!(
-            Pin::new(&mut join).poll(&mut cx),
-            Poll::Ready([])
-        );
+        assert_eq!(Pin::new(&mut join).poll(&mut cx), Poll::Ready([]));
     }
 
     #[test]
@@ -134,10 +127,7 @@ mod tests {
         ]);
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
-        assert_eq!(
-            Pin::new(&mut join).poll(&mut cx),
-            Poll::Ready([10, 20, 30])
-        );
+        assert_eq!(Pin::new(&mut join).poll(&mut cx), Poll::Ready([10, 20, 30]));
     }
 
     #[test]
