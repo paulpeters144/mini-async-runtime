@@ -1,95 +1,62 @@
-# Reactor: I/O Multiplexing with mio and the OS Poller
+# Reactor: How the Runtime Waits for Anything to Happen
 
-## 1. Concept: What Is I/O Multiplexing?
+## The Problem: Waiting Without Blocking
 
-### The Core Concept
+Picture an executor with three parked tasks. One is waiting for bytes to arrive on a network socket. Another is waiting for a timer to reach its deadline. A third is waiting for a blocking job running on a worker thread. None of them are ready right now. The ready queue is empty. But they will become ready — the socket will receive data, the deadline will pass, the worker will finish — and when they do, someone needs to notice and re-queue the right tasks. The question is: what does the executor do in the meantime?
 
-The reactor blocks the thread once, inside the kernel, and the operating system wakes it when any watched file descriptor becomes ready or a timeout elapses. Instead of blocking on each descriptor separately or busy-looping over all of them, the runtime makes a single system call and receives a batch of events that are ready right now. This is I/O multiplexing.
+The bad answers are tempting and familiar. It could spin — run a tight loop checking each source over and over, burning the CPU at a hundred percent, converting the cooperative scheduler into a space heater. It could sleep for a fixed interval — ten milliseconds, say — wake up, check everything, sleep again — which wastes CPU *and* adds avoidable latency to every response, because a task that became ready one microsecond after the executor fell asleep won't be polled for another nine. Neither approach scales, and neither respects the fact that the operating system already has machinery for exactly this job.
 
-### The Problem
+What's actually needed is to hand the OS a list of the things the executor cares about and say: "I'm going to sleep now. Wake me when *any* of these become ready, or when this much time passes — whichever happens first." The kernel suspends the thread entirely, monitors every registered source, and resumes it only when there's real work waiting. While suspended, the thread consumes zero CPU — not a fraction of a percent, not an idle spin, but truly nothing. The kernel is doing the watching, and the kernel is faster at it than any userspace loop could ever be.
 
-An async runtime watches many things simultaneously: network sockets, pipes, the worker pool's wake signal, and timer deadlines. Each of these is represented by a file descriptor (an integer handle the kernel uses to track an I/O resource). The runtime must wait for *any* of them to become ready, not just one.
+This is I/O multiplexing, and the reactor is the part of the runtime that talks to it.
 
-A blocking read on a socket parks the thread until *that* socket has data. While the thread waits, every other task, every timer, and every other socket stalls. A busy-loop that polls each descriptor in sequence wastes CPU cycles on descriptors that are not ready. Neither approach works.
+## The OS Primitives
 
-The runtime needs to block the thread *once* and be woken when *any* watched descriptor has data, or when a timeout expires — whichever comes first.
+Every major operating system provides a kernel structure for this exact purpose:
 
-### The OS Primitives
+- **Linux:** `epoll` — create an epoll instance, register file descriptors with it, and call `epoll_wait` to block until something happens.
+- **macOS/BSD:** `kqueue` — same idea, different API.
+- **Windows:** IOCP — different shape, but the same fundamental capability.
 
-Every operating system provides a kernel structure for multiplexed I/O. On Linux, it is `epoll`. On macOS and BSD, it is `kqueue`. On Windows, it is `wepoll`. The shape is the same across all of them: the kernel holds a set of (file descriptor → interest) registrations. The program tells the kernel "notify me when fd 7 becomes readable" or "notify me when fd 12 becomes writable." The kernel stores these registrations internally.
+The pattern is the same everywhere. The kernel is told "watch these file descriptors." The kernel stores the list in its own internal structures. One blocking call is made, and the kernel returns a batch of "these ones are ready."
 
-A single wait call — `epoll_wait` on Linux — blocks the thread until at least one registered file descriptor has an event, or until a timeout elapses. The kernel then returns the set of ready events. The program processes them and waits again.
+This runtime doesn't talk to `epoll` or `kqueue` directly. It uses `mio`, a Rust crate that wraps these platform-specific APIs behind a uniform interface.
 
-`mar` uses `mio`, a Rust crate that wraps these platform-specific primitives behind a uniform API. The runtime never calls `epoll` or `kqueue` directly. `mio` handles the platform differences.
+## The mio Types
 
-### Registration
+`mio` provides four key pieces:
 
-Registration means telling the kernel "watch this file descriptor for this kind of readiness." Readiness is the condition that a read or write would not block. A socket with data in its kernel receive buffer is readable. A socket with space in its send buffer is writable.
+**`mio::Poll`** is the poller itself — the `epoll` instance on Linux. `poll.poll(&mut events, timeout)` blocks until something is ready or the timeout expires. It fills the `events` buffer with information about what happened.
 
-Registration lives in the kernel, not in userspace. The kernel maintains the interest set as part of its internal state for the `epoll`/`kqueue` instance. The program does not need to keep a copy. When the program registers a new file descriptor, the kernel adds it to its set. When the program closes the descriptor, the kernel removes it. No userspace data structure is needed to track what is registered.
+**`mio::Registry`** is obtained from `poll.registry()`. It's the interface for registering and deregistering file descriptors. Code that only needs to register sources — without calling `poll` itself — can hold just a `Registry`.
 
-### `mio`
+**`mio::Token`** is a `usize` wrapper — a user-chosen label attached to each registration. When the poller returns an event, it includes the token. A network socket might be registered with token `Token(7)` and a pipe with token `Token(3)`. When the poller wakes the executor, the token tells *which* thing is ready. The kernel doesn't interpret the token — it's purely a userspace label.
 
-`mio` provides four key types:
+**`mio::Events`** is a buffer that `poll.poll()` fills with ready events. It's allocated once with a fixed capacity and reused every iteration.
 
-- **`mio::Poll`** wraps the OS poller object (the `epoll` instance on Linux). It is the thing that blocks and returns events. Created by `mio::Poll::new()`.
+## The Wakeup Trick
 
-- **`mio::Registry`** is obtained from `poll.registry()`. It is the interface for registering and deregistering file descriptors. Code that owns a `Registry` can add new sources to the poller without owning the `Poll` itself.
+`mio::Waker` is a special source. It's registered with the poller like any other file descriptor, but instead of representing a socket or pipe, it's a manual trigger. Calling `waker.wake()` from any thread causes the poller to return immediately, as if a file descriptor became ready.
 
-- **`mio::Token`** is a `usize` wrapper — a user-chosen identifier attached to each registration. When the poller returns an event, it includes the token so the caller can tell which source fired. The token is the program's own label; the kernel does not interpret it.
+This is how the worker pool tells the executor "a job finished." A worker thread, running on a completely different OS thread, calls `waker.wake()`. The kernel marks the waker's token as ready. If the executor is parked in `poll.poll()`, the kernel wakes it up with the waker's token in the events buffer. The executor then drains the completed-job channel.
 
-- **`mio::Events`** is a buffer that `poll.poll()` fills with the ready events. Each event carries its token. The buffer is overwritten on each call to `poll`.
+Without this mechanism, a worker finishing a job on another thread would have no way to unblock the executor. The result would sit in a channel that nobody is reading until some other event coincidentally woke the executor.
 
-### The Wakeup Mechanism
-
-`mio::Waker` is a special source registered with the poller. Calling `wake()` on it from any thread causes the poller to return immediately, as if a file descriptor became ready. The waker's token appears in the `Events` buffer.
-
-This is the mechanism the worker pool uses to unblock the executor. A worker thread finishes a blocking closure and needs to tell the executor "a result is ready." The worker calls `waker.wake()`. The kernel marks the waker's token as ready. The executor's parked `mio::Poll::poll` call returns with that token in the events. The executor then processes the completion.
-
-### Why an Async Runtime Cannot Use Blocking Reads
-
-A blocking read on a socket calls into the kernel and parks the thread until *that specific* socket has data. The thread cannot do anything else while it waits — it cannot poll other tasks, fire timers, or process completions from the worker pool.
-
-An async runtime must park until *any* of its watched sources has data. The multiplexing wait — `epoll_wait`, `kqueue`, or `mio::Poll::poll` — is the only mechanism that blocks once and wakes on any of many sources. This is why the reactor exists: it is the single point where the thread blocks, and it is the single point where the thread wakes.
-
----
-
-## 2. How This Runtime Implements the Reactor
-
-### The Struct
-
-From `src/reactor.rs`:
+## The Reactor Struct
 
 ```rust
-pub(crate) type ReactorHandle = Rc<RefCell<Reactor>>;
-
 pub struct Reactor {
     poll: mio::Poll,
 }
 ```
 
-### Field by Field
+One field. The reactor wraps `mio::Poll` and nothing else. There's no registration table in userspace — the kernel tracks what's registered. When the runtime registers a new source (currently just the `mio::Waker`), it calls `poll.registry()` to get the `Registry` and hands it to the registration method. The kernel does the rest.
 
-**`poll: mio::Poll`** — the OS poller object. On Linux, this wraps an `epoll` file descriptor. On macOS, a `kqueue` file descriptor. `mio::Poll::new()` creates the kernel object and returns a handle to it.
+The type alias is `ReactorHandle = Rc<RefCell<Reactor>>`. `Rc` gives shared ownership. `RefCell` gives interior mutability, which is needed because `poll(&mut self)` requires a mutable reference, but `Mar` holds the reactor behind a shared `Rc`. `RefCell::borrow_mut()` satisfies the `&mut self` requirement at runtime.
 
-There is no registration table in userspace. The kernel holds the interest set. The `Reactor` struct wraps the poller and nothing else. When the runtime needs to register a new source (a socket, the worker pool's waker), it calls `poll.registry()` to get the `Registry`, and registers through that. The kernel tracks the registration internally.
+## What the Reactor Does
 
-**`ReactorHandle`** is a type alias: `Rc<RefCell<Reactor>>`. `Rc` (reference-counted pointer) gives shared ownership — multiple parts of the code can hold a handle to the same `Reactor`. `RefCell` provides runtime-checked interior mutability, which is required because `poll(&mut self)` takes a mutable reference, but the `Mar` struct holds the reactor behind an `Rc` (a shared reference). `RefCell::borrow_mut()` satisfies the `&mut self` requirement at runtime. The borrow is scoped to the `poll` call; no user code runs while the borrow is held.
-
-### Construction
-
-```rust
-pub fn new() -> Self {
-    let poll = mio::Poll::new().unwrap();
-    Reactor { poll }
-}
-```
-
-`mio::Poll::new()` creates the OS poller. It returns `io::Result<mio::Poll>`. The `.unwrap()` is appropriate here: if the kernel cannot create an `epoll` or `kqueue` instance, the program cannot do I/O at all. There is no meaningful recovery. The program panics with the operating system's error message.
-
-`Reactor::new()` is called by `Mar::new()` (`src/mar.rs`). At that point, no sources are registered. The poller exists but is watching nothing.
-
-### Core Methods
+Two methods:
 
 ```rust
 pub fn registry(&self) -> &mio::Registry {
@@ -97,167 +64,82 @@ pub fn registry(&self) -> &mio::Registry {
 }
 ```
 
-`registry()` exposes the `mio::Registry` so that `Mar::new` can create the `mio::Waker` for the worker pool. The waker must be registered with the *same* `mio::Poll` instance that the executor will later call `poll` on. If the waker were registered with a different poller, calling `wake()` would signal a poller that nobody is waiting on, and the executor would park forever.
+Exposes the `Registry` so `Mar::new` can create the `mio::Waker`. The waker must be registered with the *same* `mio::Poll` instance that the executor will later call `poll` on. If the waker were registered with a different poller, calling `wake()` would signal nobody, and the executor would park forever.
 
 ```rust
-pub fn poll(
-    &mut self,
-    events: &mut mio::Events,
-    timeout: Option<Duration>,
-) -> io::Result<()> {
+pub fn poll(&mut self, events: &mut mio::Events, timeout: Option<Duration>) -> io::Result<()> {
     self.poll.poll(events, timeout)
 }
 ```
 
-`poll` delegates to `mio::Poll::poll`. The `events` parameter is a buffer that the kernel fills with ready events. The `timeout` parameter controls how long to block: `Some(Duration)` blocks up to that long; `None` blocks forever; `Some(Duration::ZERO)` returns immediately. The method returns `io::Result<()>` — an error only if the underlying system call fails, which is rare and unrecoverable.
+Delegates to `mio::Poll::poll`. The `events` buffer gets filled. The `timeout` controls how long to block: `Some(Duration)` blocks up to that long; `None` blocks forever; `Some(Duration::ZERO)` returns immediately (non-blocking poll).
 
-### Three Outcomes of `reactor.poll`
+## Three Outcomes of `reactor.poll`
 
-When the executor calls `reactor.poll(&mut events, timeout)`, three things can happen:
+When the executor calls this, three things can happen:
 
-**1. I/O events occurred.** One or more registered file descriptors became ready. The kernel fills the `events` buffer. Each `Event` in the buffer carries a `Token` identifying which source fired. The executor inspects these tokens. In the current codebase, only `WAKEN_TOKEN` (token 0) is registered, so the only event the executor handles is the worker pool's wake signal.
+**1. I/O events occurred.** One or more registered file descriptors became ready. The `events` buffer holds entries with tokens. The executor iterates over them. Currently only `WAKEN_TOKEN` (token 0, the pool's waker) is registered, so this always means "a worker finished something."
 
-**2. Timeout expired with no events.** The `timeout` elapsed and no file descriptor became ready. The `events` buffer is empty. The executor proceeds to fire timers. This is how timer-driven wakeups reach the event loop: the executor parks until the earliest timer deadline, and when the timeout expires, `fire_due_timers` runs.
+**2. Timeout expired, no events.** The duration elapsed and nothing became ready. The `events` buffer is empty. The executor proceeds to `fire_due_timers` — the timeout *was* the timer mechanism. The executor parked until the earliest deadline, and when it woke with an empty buffer, it knows it's time to fire expired timers.
 
-**3. `WAKEN_TOKEN` is present.** The worker pool's `mio::Waker` was signaled. A worker thread called `waker.wake()` after completing a job. The executor calls `wake_completed_blocking`, which drains the completed-id channel and wakes the specific tasks that finished.
+**3. Both.** A worker finished *and* a timeout expired. The `events` buffer has `WAKEN_TOKEN` entries. The executor handles both: wakes completed-blocking tasks, fires due timers.
 
-### What This Reactor Actually Registers Today
+## What's Actually Registered Today
 
-In the current codebase, the reactor hosts exactly one registered source: the `mio::Waker` for the worker pool. No user I/O sources — sockets, pipes, or anything else — are registered. The `registry()` method exists as the seam where a future I/O driver would register sockets and other sources. That driver is intentionally out of scope for this runtime.
+Right now, the reactor watches exactly one thing: the worker pool's `mio::Waker`. No sockets, no pipes, no user I/O.
 
-The reactor is the *infrastructure* for I/O multiplexing. It wraps the OS poller and provides the `poll` and `registry` methods. Building an I/O driver on top of it — one that registers sockets, maps tokens to wakers, and handles read/write readiness — is a separate layer of work.
+This might seem like overkill — why wrap a whole OS multiplexer just for one wake signal? Because the reactor is *infrastructure*. The `registry()` method is the seam where a future I/O driver would register sockets. Building a full TCP/UDP driver is intentionally out of scope for this small runtime, but the plumbing is ready. When someone adds a socket, they call `registry.register(socket, Token(1), Interests::READABLE)` and the kernel starts watching it. The reactor doesn't change at all.
 
-### Worked Example: The Pool Wake
+## Walking Through the Pool Wake
 
-Trace the path from a worker finishing a job to the executor processing the completion.
+A worker finishes a job. Here's the full path:
 
-1. A worker thread in the `WorkerPool` (`src/task/worker_pool.rs`) finishes running a closure. The worker calls `w.wake()`, where `w` is the `Arc<mio::Waker>` the worker received at construction. This `mio::Waker` was created by `mio::Waker::new(registry, WAKEN_TOKEN)` during `Mar::new`, registered with the same `mio::Poll` the reactor wraps.
+1. **Worker wakes.** The worker thread calls `w.wake()` on its `Arc<mio::Waker>`. This `mio::Waker` was created in `Mar::new` with `mio::Waker::new(registry, WAKEN_TOKEN)`, registered with the same `mio::Poll` the reactor wraps.
 
-2. `mio::Waker::wake()` makes a system call (`eventfd_write` on Linux) that tells the kernel "mark this source ready." The kernel marks the waker's file descriptor as readable. Since this file descriptor is registered with the `epoll` instance, the `epoll_wait` call that the executor is currently blocked inside returns immediately.
+2. **Kernel responds.** `wake()` makes a system call (`eventfd_write` on Linux) that tells the kernel "mark this source ready." Since the waker's file descriptor is registered with the `epoll` instance, `epoll_wait` returns immediately.
 
-3. `mio::Poll::poll` returns `Ok(())`. The `events` buffer contains one event with `token() == WAKEN_TOKEN`.
+3. **Executor resumes.** `mio::Poll::poll` returns. The `events` buffer contains one event with `token() == WAKEN_TOKEN`.
 
-4. The executor's `poll_readiness_events` (`src/mar.rs`) returns. The executor proceeds to `fire_due_timers` (no-op if no timers are due), then to `wake_completed_blocking`.
+4. **Executor processes.** `wake_completed_blocking` sees the token, drains the completed-id channel, looks up each `BlockingId` in `blocking_wakers`, and calls `wake_by_ref()` to push task ids onto the ready queue.
 
-5. `wake_completed_blocking` iterates over `events`. It finds the event with `WAKEN_TOKEN`. It calls `runtime.pool.drain_completed()`, which returns a `Vec<BlockingId>` of all completed blocking jobs. For each `BlockingId`, it looks up the corresponding waker in `state.blocking_wakers` and calls `wake_by_ref()`. This pushes the task's id into the ready queue.
+5. **Next drain.** The ready queue has the task's id. The executor polls it. The `BlockingTask` reads its result and returns `Ready`.
 
-6. The next iteration of the executor loop calls `drain_ready_queue`, which pops the task id, looks up the task, and re-polls it. The `BlockingTask` reads its result channel, finds the result, and returns `Ready`.
+## Walking Through a Timer Wake
 
-### Worked Example: The Timer Path
+No worker is involved. Just a `Sleep` future:
 
-Trace the path from an executor parking to a timer firing.
+1. **Executor drains.** The ready queue is empty. `is_done` finds a parked task and a timer entry. Not done.
 
-1. The executor drains the ready queue and finds it empty. `is_done` checks: the task table is non-empty (a `Sleep` future is parked), the timer registry is non-empty (it has one entry), `blocking_wakers` is empty. The executor is not done.
+2. **Compute timeout.** `compute_timeout` calls `wheel.next_deadline()`, gets `Some(deadline)` 1 second from now. Timeout is `Some(1s)`.
 
-2. `compute_timeout` calls `wheel.next_deadline()`, which returns `Some(deadline)`. The timeout is `deadline.saturating_duration_since(Instant::now())` — the duration until the timer fires. Say the deadline is 1 second away, so the timeout is `Some(Duration::from_secs(1))`.
+3. **Park.** `reactor.poll(&mut events, Some(1s))`. The thread blocks in the kernel. No file descriptors are ready, so the kernel waits.
 
-3. The executor calls `reactor.poll(&mut events, Some(Duration::from_secs(1)))`. The thread blocks inside the kernel. No file descriptors are ready (no worker has finished), so the kernel waits.
+4. **Timeout.** One second passes. `mio::Poll::poll` returns. The `events` buffer is empty — no I/O, just time.
 
-4. One second passes. The timeout expires. `mio::Poll::poll` returns `Ok(())`. The `events` buffer is empty — no file descriptor became ready; only the timeout fired.
+5. **Fire timers.** `fire_due_timers` calls `wheel.expire_due()`. The expired entry's waker fires. Task id on the ready queue.
 
-5. The executor's `poll_readiness_events` returns. `fire_due_timers` calls `wheel.expire_due()`, which scans the timer registry, finds the entry with `deadline <= now`, collects its waker, and calls `wake_by_ref()`. The task's id is pushed into the ready queue.
+6. **Next drain.** Task polled. `Sleep` returns `Ready`. Done.
 
-6. The next iteration calls `drain_ready_queue`, pops the task, re-polls the `Sleep` future, which sees `Instant::now() >= deadline` and returns `Ready`.
+## Design Choices
 
-### Interactions
+**Why no userspace registration state?** The kernel stores the interest set internally. If a socket was registered with `epoll`, the kernel knows about it. When the socket is closed, the kernel removes it automatically. Mirroring this in a userspace `HashMap<Token, Source>` would duplicate kernel state and create a desync risk. The cost: when the executor receives an event with a token, it has no userspace map to tell it what that token means. In the current code, only `WAKEN_TOKEN` exists, so a simple `if` check suffices. A future I/O driver would bring its own token-to-waker map.
 
-- **`Mar::new`** (`src/mar.rs`) calls `Reactor::new()` to create the poller, then calls `reactor.borrow().registry()` to get the `Registry` for creating the `mio::Waker`.
-- **`Mar::run`** calls `poll_readiness_events` every iteration, which calls `reactor.borrow_mut().poll(&mut events, timeout)`.
-- **`WorkerPool` workers** (`src/task/worker_pool.rs`) call `w.wake()` on the `Arc<mio::Waker>` after every job. This signals the reactor from another thread.
-- The interaction is bidirectional: `Mar` creates and polls the reactor; the worker pool wakes the reactor from other threads.
+**Why `RefCell` instead of `Mutex`?** The reactor is accessed only from the executor thread. `RefCell` panics loudly on misuse; `Mutex` would add unnecessary locking overhead and hide bugs as silent deadlocks.
 
-### Source Links
+**What `WAKEN_TOKEN` means.** It's `mio::Token(0)`, a reserved token. The executor needs to distinguish "the pool woke me" from "a socket woke me." Token 0 is reserved so the pool's wake is unambiguous. `wake_completed_blocking` checks `if event.token() == WAKEN_TOKEN`.
 
-- `src/reactor.rs` — the `Reactor` struct and its methods.
-- `src/mar.rs` — `Mar::new` (reactor creation, waker registration), `poll_readiness_events` (the poll call), `wake_completed_blocking` (token handling).
-- `src/task/worker_pool.rs` — the worker loop that calls `w.wake()`.
+## Common Misconceptions
 
----
+**"The reactor polls futures."** The reactor doesn't know what a future is. It blocks the thread and produces OS events. The executor polls futures. The reactor's only job is to park the thread efficiently and wake it when something happens.
 
-## 3. Design Decisions
+**"Parked means the thread is running a loop."** When `mio::Poll::poll` blocks with a timeout, the thread is inside a kernel system call (`epoll_wait`). It's not executing Rust. It's not consuming CPU. The kernel suspends the thread and resumes it only when an event arrives or the timeout expires.
 
-### Why No In-Userspace Registration State
+**"An empty events buffer is an error."** It's a normal timer wakeup. The timeout expired, no I/O happened. The executor proceeds to fire timers. An empty buffer means "only time passed."
 
-The kernel stores the interest set. When the program registers a file descriptor with `mio::Registry::register`, the kernel adds it to its internal `epoll`/`kqueue` set. When the program closes the descriptor, the kernel removes it. The `Reactor` struct does not mirror this in a `HashMap<Token, Source>` or similar structure.
+**"Most writes need the reactor."** OS write buffering makes most writes return immediately — the kernel copies data into a send buffer and returns control. The reactor is needed for *readiness waiting* — when the kernel's buffer is full and a write would block, or when waiting for data that hasn't arrived yet.
 
-Storing a parallel map in userspace would duplicate kernel state and create a desync risk: if the program closes a file descriptor without deregistering it, the userspace map would still list it. The kernel handles this automatically — closing a descriptor removes it from the `epoll` set.
+## Summary
 
-The cost of this choice: when the executor receives an event with a token, it has no userspace map to look up what that token corresponds to. In the current codebase this is not a problem because only `WAKEN_TOKEN` is registered, and the executor handles it with a simple `if` check. A future I/O driver that registers sockets would need its own token-to-waker map — but that map would be part of the driver, not the reactor.
+The reactor wraps the OS poller (`epoll`/`kqueue`) behind `mio::Poll`. It blocks the thread once, inside the kernel, and returns events for any ready file descriptor or expired timeout. Currently it watches one thing: the worker pool's `mio::Waker`. The `registry()` method is the seam where sockets and other I/O sources would plug in. The executor couples its park timeout to the earliest timer deadline, so the OS's own timeout mechanism drives timer wakeups without a dedicated timer thread.
 
-### Why `RefCell` for `poll(&mut self)` Through a Shared Reference
-
-`Mar` holds the reactor behind `Rc<RefCell<Reactor>>`. Calling `reactor.poll(&mut self)` requires a mutable reference. `RefCell::borrow_mut()` provides this at runtime. The borrow is scoped to the `poll` call — it starts when `borrow_mut()` is called and ends when the returned `RefMut` is dropped, which happens within `poll_readiness_events`.
-
-A `Mutex` would provide the same `&mut self` access, but `Mutex` exists to protect data shared across threads. The reactor is only accessed from the executor thread. Using `Mutex` here would add unnecessary locking overhead and, worse, would hide borrow-order bugs as potential deadlocks instead of panicking loudly at the violating borrow.
-
-### Why the Reactor Is Behind `Rc`
-
-During `Mar::new`, the reactor is created first, then borrowed (`reactor.borrow()`) to get the `Registry` for creating the `mio::Waker`. The `Registry` reference must remain valid while `mio::Waker::new` runs. After construction, the worker pool holds an `Arc<mio::Waker>` — a reference-counted handle to the waker — but does not hold the reactor itself. The reactor is shared between `Mar` (which polls it) and the construction code (which registers the waker), but the pool only needs the waker, not the reactor.
-
-### What `WAKEN_TOKEN` Is For
-
-`WAKEN_TOKEN` is `mio::Token(0)`, a reserved token for the worker pool's `mio::Waker`. From `src/mar.rs`:
-
-```rust
-const WAKEN_TOKEN: mio::Token = mio::Token(0);
-```
-
-The executor needs to distinguish "the worker pool woke me" from "a file descriptor became ready." Token 0 is reserved so the pool's wake is unambiguously distinguishable from any future I/O event tokens. `wake_completed_blocking` checks `if event.token() == WAKEN_TOKEN` before draining the completed channel.
-
-If the token were not reserved — if the pool's waker and a socket shared the same token space — the executor would not know whether to drain completions or read from a socket. Reserving token 0 makes the distinction trivial.
-
-### When This Changes
-
-Adding an I/O driver (for sockets, pipes, or other file descriptors) would add:
-
-- Per-source registration: calling `registry.register(source, token)` for each socket.
-- A token-to-waker map: when a socket event arrives, the executor looks up the token in the map to find the waker for the task waiting on that socket.
-- Edge-triggered or level-triggered interest management: `mio` supports both, and the choice affects how the driver handles partial reads and writes.
-
-The reactor itself would not change. It already wraps the OS poller and exposes `registry()` and `poll()`. The I/O driver would use these methods; it would not modify the reactor.
-
----
-
-## 4. Failure Modes and Misconceptions
-
-### What Breaks If the Executor Parked with `None` Timeout While Timers Existed
-
-If `compute_timeout` returned `None` (meaning "no timeout, park forever") while the timer registry had entries, the executor would block inside `mio::Poll::poll` indefinitely. No file descriptor would become ready (no worker is running), and no timeout would expire (there is none). The timer's deadline would pass, but the executor would not wake to fire it. The `Sleep` future would never be re-polled, and `run()` would hang.
-
-The defense is the coupling between `compute_timeout` and `next_deadline`: `compute_timeout` always derives the timeout from the earliest timer deadline. If a timer exists, `next_deadline` returns `Some`, and the timeout is `Some(duration)`. The executor never parks with `None` while timers exist.
-
-### What Breaks If the `mio::Waker` Were Created on a Different Poll Instance
-
-During `Mar::new`, the `mio::Waker` is created with `mio::Waker::new(registry, WAKEN_TOKEN)`, where `registry` comes from `reactor.borrow().registry()`. This binds the waker to the same `mio::Poll` instance that the reactor wraps.
-
-If the waker were created on a different poll instance — say, a fresh `mio::Poll::new()` — calling `waker.wake()` would signal *that* poller, not the one the executor is parked on. The executor's `mio::Poll::poll` would never return. The program would hang.
-
-The code enforces this by construction: `Mar::new` creates the reactor, borrows it to get the registry, and creates the waker in the same function. There is no way to accidentally use a different registry.
-
-### What Breaks If the Reactor Is Dropped While the Worker Pool Still Holds the `mio::Waker`
-
-The `mio::Waker` is an `Arc<mio::Waker>`, not a reference to the reactor. It holds its own file descriptor (on Linux, an `eventfd`). Dropping the reactor closes the `epoll` instance, but the waker's file descriptor remains open. Calling `wake()` on a waker whose poll instance is closed will succeed at the system-call level (the `eventfd_write` succeeds), but no `epoll_wait` will ever observe it. The wake is lost. If the executor were somehow still parked on that closed poll instance, it would get an error, not a wake.
-
-In practice this does not happen because the reactor and the worker pool are both owned by `Mar`, and `Mar::drop` runs them in field-declaration order. The pool drops first (its `shutdown` closes the job channel and joins workers), then the reactor drops. By the time the reactor drops, no worker is alive to call `wake()`.
-
-### Common Misunderstandings
-
-1. **"The reactor polls futures."** The reactor does not know about futures. It blocks the thread and produces events. The executor polls futures. The reactor's only job is to park the thread efficiently and wake it when something happens.
-
-2. **"Parked means the thread is running a loop in userspace."** When `mio::Poll::poll` blocks, the thread is inside a kernel system call (`epoll_wait` on Linux). It is not executing any Rust code. It is not consuming CPU cycles. The kernel suspends the thread and resumes it when an event arrives or a timeout expires.
-
-3. **"An empty `Events` buffer after a timeout is an error."** It is a normal timer wakeup. The timeout expired, no file descriptor became ready, and the executor proceeds to fire timers. The empty buffer means "nothing I/O-related happened; only time passed."
-
-4. **"Writes need the reactor."** OS write buffering makes most writes return immediately. The kernel copies the data into a send buffer and returns control to the program. The reactor is needed for *readiness waiting* — waiting until a file descriptor can accept a read or write without blocking. Writes that fill the buffer and block are rare and would use the reactor only if the program needed to wait for buffer space.
-
----
-
-## 5. Summary
-
-- The reactor wraps the OS poller (`epoll`/`kqueue`) behind `mio::Poll`. It blocks the thread once and returns events for any ready file descriptor or timeout expiration.
-
-- The reactor currently registers only the worker pool's `mio::Waker` (token `WAKEN_TOKEN`). The `registry()` method is the seam where a future I/O driver would register sockets and other sources.
-
-- The executor calls `reactor.poll()` every iteration. The timeout is derived from the earliest timer deadline. Worker threads call `waker.wake()` from other threads to unblock the executor when a blocking job completes.
-
-- The reactor exists because an async runtime must block the thread *once* and wake on *any* readiness event. Blocking on individual descriptors or busy-looping would stall or waste CPU.
+Source: `src/reactor.rs`

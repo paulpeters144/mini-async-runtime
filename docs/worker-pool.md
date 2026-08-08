@@ -1,32 +1,20 @@
-# Worker Pool: Offloading Blocking Work
+# Worker Pool: Running Expensive Code Without Freezing the Runtime
 
-## 1. Concept: Why a Thread Pool?
+## Why Heavy Work Cannot Run on the Executor Thread
 
-### The Core Concept
+Everything in this runtime shares one thread. The executor loop, the task polling, the timer registry, the reactor — every part of the scheduling machinery runs on the same OS thread. This is the source of the runtime's simplicity, its speed, and its freedom from data races: there's only one place work happens, so there's nothing to synchronize. But it comes with a hard rule: the single thread must never be blocked.
 
-A fixed set of OS threads runs blocking closures off the executor thread, so a long computation or a blocking call freezes nothing else in the runtime. The rest of the section is the deep dive.
+A computation that runs for two hundred milliseconds on the executor thread doesn't just delay one task — it freezes every task in the system for two hundred milliseconds. Timers can't fire because nobody is checking them. The reactor can't process I/O events because nobody is parked inside the kernel. Worker threads can finish jobs and signal the pool, but nobody is listening to the completion channel. The thread isn't polling, it isn't waiting efficiently, it isn't doing any of the things that make the async model work. It's just running synchronous code, blind to everything else, and cooperative scheduling gives nobody the power to interrupt it.
 
-### The Problem
+Some work cannot be broken into async pieces. CPU-heavy loops, synchronous file I/O that lacks an async API, FFI calls into C libraries that block internally — these run start-to-finish before returning control to the caller. There's no `.await` to insert to yield the thread back, because the function doesn't return until it's done. This work cannot be made cooperative, which means it cannot run on the executor thread without freezing everything else. It needs somewhere else to go — a different thread, one whose only job is to run the slow stuff and report back.
 
-Some work cannot be made async. Synchronous file I/O, CPU-heavy computation, and blocking C libraries all run to completion before returning control. If that work runs on the executor thread, a 200ms computation freezes every other task, every timer, and all I/O for 200ms. The executor thread is the runtime's only thread; anything that blocks it blocks the entire system.
+## The Solution: A Fixed Set of Helper Threads
 
-### The Solution
+A small pool of dedicated OS threads whose only job is to run blocking closures. The executor never runs a blocking closure itself. Instead, it hands the closure to the pool through a channel, and the pool runs it on a different thread. The executor continues polling other tasks while the work runs elsewhere.
 
-A fixed set of worker threads that run blocking closures, and channels that carry closures from the executor to the workers and results back. The executor never runs a blocking closure itself; it hands the closure to the pool and waits for the result asynchronously.
+When the closure finishes, the pool notifies the executor, which wakes the task that was waiting for the result. To the awaiting task, `spawn_blocking(f).await` looks like any other async operation — it returns `Pending`, the runtime moves on, and eventually the task resumes with the result.
 
-### How `spawn_blocking` Bridges Sync and Async
-
-`task::spawn_blocking(f)` returns a future. The first poll submits the closure to the pool and returns `Pending`; a later poll — after a worker finished — reads the result and returns `Ready(value)`. To the awaiting task it looks like any other async operation. The bridge works because each job gets its own result channel: the worker sends the value through the channel, and the `BlockingTask` future reads it on the executor thread.
-
-### Why a Fixed-Size Pool
-
-Thread creation is expensive — a kernel thread allocates a stack and registers with the OS scheduler — so threads are created once and reused. A fixed size bounds memory usage and OS-thread count. This runtime uses 3 workers by default.
-
-## 2. How This Runtime Implements WorkerPool
-
-### The Type Alias and Struct
-
-The pool lives in `src/task/worker_pool.rs`:
+## The Struct
 
 ```rust
 pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -39,31 +27,25 @@ pub struct WorkerPool {
 }
 ```
 
-### Field by Field
+**`Job`** — a type-erased closure. `FnOnce` means it runs once and consumes its captures (the closure is destroyed after execution). `Send` means it can move to another thread. `'static` means it owns everything it references — no borrowing from the executor's stack, because the executor might move on while the closure is still running.
 
-**`job_tx: Option<mpsc::Sender<Job>>`.** The executor→workers channel. The `Option` exists so `shutdown` can take the sender out of the struct during `Drop`; you cannot move out of a field in `Drop` without wrapping it. Taking it closes the channel, which causes every worker's `recv()` to return `Err` and exit.
+**`job_tx: Option<mpsc::Sender<Job>>`** — the channel for sending closures from the executor to the workers. One producer (the executor), N consumers (the workers). The `Option` exists so shutdown can `take` the sender out of the struct to close the channel.
 
-**`workers: Vec<JoinHandle<()>>`.** One `JoinHandle` per worker thread. `JoinHandle` is the std type that represents a running thread; `join()` blocks until the thread exits and returns its result.
+**`workers: Vec<JoinHandle<()>>`** — one handle per worker thread. `join()` on a handle blocks until that thread exits.
 
-**`completed_tx: mpsc::Sender<BlockingId>`.** Workers→executor channel, sender side. Each worker sends the `BlockingId` of the job it just finished, so the executor knows which task to wake.
+**`completed_tx` and `completed_rx`** — the channel for workers to tell the executor which jobs finished. N producers (workers), one consumer (the executor). Workers send `BlockingId`s through this channel; the executor drains them and wakes the corresponding tasks.
 
-**`completed_rx: mpsc::Receiver<BlockingId>`.** The receiver side, kept on the pool. The executor calls `drain_completed()` to pull all pending ids.
+Notice: this is *two* channels, not one. The job channel carries closures one way. The completed channel carries ids the other way. They serve different producers, different consumers, and different data types.
 
-### `Job`
-
-`Box<dyn FnOnce() + Send + 'static>` is a type-erased closure. `FnOnce` means it runs once and consumes its captures. `Send` means it can be moved to another thread. `'static` means it owns everything it references — no borrowed data from the executor's stack. Return values do not travel through the `Job` itself; each job gets its own per-job result channel (see `spawn_blocking`).
-
-### Construction
-
-`with_count` in `src/task/worker_pool.rs`:
+## Starting the Pool
 
 ```rust
 pub fn with_count(waker: Arc<mio::Waker>, n: usize) -> Self {
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (completed_tx, completed_rx) = mpsc::channel();
     let job_rx = Arc::new(Mutex::new(job_rx));
-    let mut workers = Vec::with_capacity(n);
 
+    let mut workers = Vec::with_capacity(n);
     for _ in 0..n {
         let rx = job_rx.clone();
         let w = waker.clone();
@@ -83,56 +65,22 @@ pub fn with_count(waker: Arc<mio::Waker>, n: usize) -> Self {
         }));
     }
 
-    WorkerPool {
-        job_tx: Some(job_tx),
-        workers,
-        completed_tx,
-        completed_rx,
-    }
+    WorkerPool { job_tx: Some(job_tx), workers, completed_tx, completed_rx }
 }
 ```
 
-Line by line. The job channel is created with `mpsc::channel()`. The completed channel is created the same way. The `job_rx` receiver is wrapped in `Arc<Mutex<_>>` because `mpsc::Receiver` is not `Clone`, but N workers must share one receiver; the `Mutex` serializes access. Each thread gets a clone of the shared receiver and a clone of the `mio::Waker`.
+Each worker thread runs the same loop forever:
 
-### The Worker Loop
+1. **Wait for a job.** `recv()` blocks until a closure arrives on the job channel.
+2. **Run it.** The closure is executed inside `catch_unwind` — if the closure panics, the worker catches it and keeps running. A dead worker permanently reduces capacity.
+3. **Wake the executor.** After every job (successful or panicked), the worker calls `w.wake()` on the shared `mio::Waker`. This unblocks the executor's parked `mio::Poll::poll` so it can process the result.
+4. **Exit on close.** When `recv()` returns `Err`, the job channel has been closed (the runtime is shutting down). The worker exits the loop.
 
-Each worker runs this loop:
+The `job_rx` receiver is wrapped in `Arc<Mutex<...>>` because `mpsc::Receiver` isn't `Clone`, but N workers must share one receiver. The `Mutex` serializes access: only one worker waits on the receiver at a time. This is safe because the channel is unbounded (so `send` never blocks) and `recv()` blocks while holding the lock — which is fine, since the lock isn't needed by anyone else while the worker waits.
 
-```rust
-let job = rx.lock().unwrap().recv();
-match job {
-    Ok(job) => {
-        let _ = std::panic::catch_unwind(
-            std::panic::AssertUnwindSafe(job),
-        );
-        let _ = w.wake();
-    }
-    Err(_) => break,
-}
-```
+## How `spawn_blocking` Builds the Bridge
 
-`recv()` blocks until a job arrives. The closure runs inside `catch_unwind` — defense-in-depth against panics. After every job the worker calls `w.wake()` on the `mio::Waker` to wake the executor. The wake is unconditional: even if the job panicked, the worker still wakes the executor so it can observe the result (or the panic payload). On `Err` (channel closed) the worker exits the loop.
-
-### Why `w.wake()` and Not a Channel
-
-The executor is parked inside `mio::Poll::poll`. A message pushed to a channel would sit in memory because nothing is reading it. The `mio::Waker` is registered with the OS poller, so `wake()` causes the kernel to unblock the parked thread. It is the only cross-thread→main-thread wake path.
-
-### Shutdown
-
-```rust
-pub(crate) fn shutdown(&mut self) {
-    drop(self.job_tx.take());
-    for handle in self.workers.drain(..) {
-        let _ = handle.join();
-    }
-}
-```
-
-`drop(self.job_tx.take())` takes the sender out of the `Option` and drops it, closing the channel. Every worker's `recv()` returns `Err`, the `break` fires, and the thread exits. The loop then joins every handle. `Drop` delegates to `shutdown()` so the teardown order lives in one place and is idempotent (the `Option` is `None` on the second call).
-
-### `spawn_blocking`
-
-In `src/task/blocking.rs`:
+Here's the function that turns a synchronous closure into an async future:
 
 ```rust
 pub fn spawn_blocking<F, R>(f: F) -> BlockingTask<R>
@@ -141,11 +89,7 @@ where
     R: Send + 'static,
 {
     let (state, job_tx, completed_tx) = context::with(|ctx| {
-        (
-            ctx.state.clone(),
-            ctx.job_tx.clone(),
-            ctx.completed_tx.clone(),
-        )
+        (ctx.state.clone(), ctx.job_tx.clone(), ctx.completed_tx.clone())
     });
 
     let task_id = {
@@ -162,26 +106,40 @@ where
         let _ = completed_tx.send(task_id);
     });
     job_tx.send(job).expect("worker pool is shut down");
-    BlockingTask {
-        state,
-        id: task_id,
-        rx: Some(rx),
-        done: false,
-    }
+
+    BlockingTask { state, id: task_id, rx: Some(rx), done: false }
 }
 ```
 
-Line by line. `context::with` reads the thread-local runtime handle and clones the state, job sender, and completed-id sender. A `BlockingId` is allocated from `next_blocking_id` (monotonically increasing, never reused). A per-job result channel `mpsc::channel::<std::thread::Result<R>>()` is created; it carries the closure's value *or* its panic payload. The job closure wraps the user closure in `catch_unwind`, sends the result through the per-job channel, then sends the `BlockingId` through the completed channel. The job is dispatched to the pool. The `BlockingTask` future is returned to the caller.
+Let's walk through what's happening:
+
+1. **Read the context.** Clone the runtime's state, job sender, and completed-id sender from the thread-local context.
+2. **Allocate a `BlockingId`.** Bump the counter, get a unique id for this job.
+3. **Create a per-job result channel.** `mpsc::channel::<Result<R>>()`. This private channel connects the worker (which sends the result) to the `BlockingTask` future (which receives it). Each job gets its own channel.
+4. **Build the closure.** The closure captures the user's function `f`, the result sender `tx`, and the completed-id sender `completed_tx`. When the worker runs it: it calls `catch_unwind(f)`, sends the result through the private channel, and sends the `BlockingId` through the completed channel so the executor knows which task to wake.
+5. **Dispatch.** Send the closure through the job channel to the pool.
+6. **Return the future.** `BlockingTask` is the future the caller awaits.
+
+## The `BlockingTask` Future
+
+```rust
+pub struct BlockingTask<R> {
+    state: Rc<RefCell<RuntimeState>>,
+    id: BlockingId,
+    rx: Option<mpsc::Receiver<std::thread::Result<R>>>,
+    done: bool,
+}
+```
+
+It holds the runtime state (so it can register and remove its waker), the blocking id (so the executor can find it), the receiving end of the per-job result channel, and a `done` flag.
 
 ### `BlockingTask::poll`
 
 ```rust
 fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
     let this = self.get_mut();
-    if this.done {
-        unreachable!("BlockingTask polled after completion");
-    }
 
+    // Refresh the waker — the executor might give a different one.
     this.state
         .borrow_mut()
         .blocking_wakers
@@ -200,15 +158,24 @@ fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
             this.state.borrow_mut().blocking_wakers.remove(&this.id);
             std::panic::resume_unwind(payload);
         }
-        Err(mpsc::TryRecvError::Empty) => Poll::Pending,
-        Err(mpsc::TryRecvError::Disconnected) => {
+        Err(TryRecvError::Empty) => Poll::Pending,
+        Err(TryRecvError::Disconnected) => {
             panic!("worker thread disconnected without sending a result");
         }
     }
 }
 ```
 
-The waker upsert runs on every poll: `entry().and_modify().or_insert()` refreshes the stored waker in place (the task may be re-scheduled with a different waker) or inserts a new one. Then `try_recv` checks the per-job channel: `Ok(Ok(r))` means the closure returned a value — remove the entry and return `Ready`. `Ok(Err(payload))` means the closure panicked — remove the entry and `resume_unwind` the payload on the executor thread, inside the awaiting task's poll. `Err(Empty)` means the worker has not finished yet — return `Pending`. `Err(Disconnected)` means the worker died without sending a result — panic.
+Every poll does two things:
+
+First, it registers (or refreshes) a waker in `blocking_wakers` under its `BlockingId`. This tells the executor "when job N finishes, wake *this* task." The `and_modify().or_insert()` pattern refreshes the waker in place if it already exists, or inserts a new one if this is the first poll.
+
+Then it checks the result channel with `try_recv()` (non-blocking):
+
+- **`Ok(Ok(result))`** — the closure returned a value. Clean up the waker entry and return `Ready(result)`.
+- **`Ok(Err(payload))`** — the closure panicked. Clean up the entry and re-raise the panic on the executor thread via `resume_unwind`. This surfaces the panic in the task that awaited the `BlockingTask`, not in the worker.
+- **`Err(Empty)`** — the worker hasn't finished yet. Return `Pending`.
+- **`Err(Disconnected)`** — the worker died without sending a result. This should never happen (workers are protected by `catch_unwind`), so it panics.
 
 ### `BlockingTask::Drop`
 
@@ -222,11 +189,11 @@ impl<R> Drop for BlockingTask<R> {
 }
 ```
 
-If the task is dropped before completion (cancelled), the waker entry must be removed. A stale entry in `blocking_wakers` blocks `is_done` forever — the runtime's termination check requires that map to be empty.
+If the task is dropped before the job finishes — the future was cancelled, or the runtime is shutting down — the waker entry must be removed from `blocking_wakers`. A stale entry blocks `is_done` forever, and `run()` hangs.
 
-### Executor Side: `wake_completed_blocking`
+## The Executor Side: Processing Completions
 
-In `src/mar.rs`:
+When the reactor returns with `WAKEN_TOKEN`, the executor calls `wake_completed_blocking`:
 
 ```rust
 fn wake_completed_blocking(runtime: &Mar) {
@@ -247,72 +214,67 @@ fn wake_completed_blocking(runtime: &Mar) {
 }
 ```
 
-When the reactor returns with `WAKEN_TOKEN`, the executor drains all pending completed ids. For each id it looks up the corresponding waker in `blocking_wakers` and calls `wake_by_ref()`, which pushes the *task's* id onto the ready queue. The split responsibility is important: waking does not remove the entry; the entry is removed by `BlockingTask::poll` when it observes the result, or by its `Drop` if cancelled.
+For each completed job: look up the `BlockingId` in `blocking_wakers`, find the waker for the task that's awaiting it, and call `wake_by_ref()`. This pushes the *task's* id onto the ready queue.
 
-### Worked Example
+Note that waking does *not* remove the entry from the map. That's the `BlockingTask`'s responsibility — when it gets polled and finds the result, it removes its own entry. Waking is a signal; cleanup is the recipient's job.
 
-Trace `task::spawn_blocking(|| 21 * 2).await` inside `Mar::run`. The root task is `TaskId(0)`. The blocking id counter starts at `BlockingId(0)`.
+## Walking Through a Full Cycle
 
-1. **First poll.** `spawn_blocking` reads the context, allocates `BlockingId(0)`, creates a per-job result channel `(tx, rx)`. The job closure captures `f`, `tx`, and `completed_tx`. The job is sent to the pool. A `BlockingTask` is returned. The awaiting future polls it: `BlockingTask::poll` inserts the waker under `BlockingId(0)` in `blocking_wakers`, then `try_recv` returns `Err(Empty)` — `Pending`. The task's id is re-queued by its own waker.
+Let's follow `task::spawn_blocking(|| 21 * 2).await` inside `Mar::run`. Root task is `TaskId(0)`. Blocking id counter starts at `BlockingId(0)`.
 
-2. **Worker receives.** A worker thread locks the shared receiver, calls `recv()`, gets the job. It runs `catch_unwind(f)`: `f` returns `42`, so `catch_unwind` returns `Ok(42)`. The worker sends `Ok(42)` on `tx`, then sends `BlockingId(0)` on `completed_tx`. It calls `w.wake()`.
+**1. `spawn_blocking` is called.** It reads the context, allocates `BlockingId(0)` (counter becomes `BlockingId(1)`), creates a per-job result channel, wraps `|| 21 * 2` in a job closure, and sends it to the pool. It returns `BlockingTask { id: BlockingId(0), ... }`.
 
-3. **Executor wakes.** The `mio::Waker::wake()` call unblocks the parked `mio::Poll::poll`. The reactor returns with `WAKEN_TOKEN`. `wake_completed_blocking` drains `[BlockingId(0)]`, looks up the waker stored under `BlockingId(0)` in `blocking_wakers`, and calls `wake_by_ref()`. This pushes `TaskId(0)` onto the ready queue.
+**2. The awaiting future polls the `BlockingTask`.** `BlockingTask::poll` registers the waker under `BlockingId(0)` in `blocking_wakers`. `try_recv()` returns `Empty` — the worker hasn't started yet. Returns `Pending`. Task parks.
 
-4. **Second poll.** The drain pops `TaskId(0)`, polls the task. `BlockingTask::poll` refreshes the waker entry, then `try_recv` returns `Ok(Ok(42))`. The entry is removed from `blocking_wakers`, `done` is set to `true`, and `Ready(42)` is returned. The future completes; the task drops.
+**3. A worker picks up the job.** It receives the closure, runs `catch_unwind(|| 21 * 2)` → `Ok(42)`. Sends `Ok(42)` through the per-job result channel. Sends `BlockingId(0)` through the completed channel. Calls `wake()` on the `mio::Waker`.
 
-State after: task table `{}`, `blocking_wakers = {}`, queue `[]`.
+**4. The executor wakes.** The reactor returns with `WAKEN_TOKEN`. `wake_completed_blocking` drains `[BlockingId(0)]`, finds the waker under that key, and calls `wake_by_ref()`. `TaskId(0)` is pushed onto the ready queue.
 
-### Source Links
+**5. The task is polled again.** `BlockingTask::poll` refreshes the waker, then `try_recv()` returns `Ok(Ok(42))`. It removes the `BlockingId(0)` entry from `blocking_wakers`, sets `done = true`, returns `Ready(42)`. The task completes. Tables are empty. `run()` returns.
 
-- `src/task/worker_pool.rs` — the `WorkerPool` struct, construction, worker loop, shutdown
-- `src/task/blocking.rs` — `spawn_blocking`, `BlockingTask`, its `poll` and `Drop`
-- `src/mar.rs` — `wake_completed_blocking`, `Mar::new`
+## Shutdown
 
-## 3. Design Decisions and Tradeoffs
+When `Mar::run` finishes and `runtime` drops:
 
-**Why two channels instead of one.** The job channel carries closures: one producer (the executor), N consumers (workers). The completed channel carries `BlockingId`s: N producers (workers), one consumer (the executor). Reusing one channel would mean every worker consuming every other worker's completion and broadcasting results. The second channel lets the executor wake only the task that finished. Broadcast-waking would be correct but wasteful — every blocked task would re-poll and re-find nothing.
+```rust
+pub(crate) fn shutdown(&mut self) {
+    drop(self.job_tx.take());
+    for handle in self.workers.drain(..) {
+        let _ = handle.join();
+    }
+}
+```
 
-**Why `catch_unwind`.** A panicking job must not kill a worker. A dead worker permanently reduces capacity and strands future jobs. The payload is shipped back through the per-job result channel and re-raised on the executor thread via `resume_unwind`, so the panic surfaces in the task that awaited it, not in the worker.
+First, take the job sender out and drop it. The channel closes. Every worker's `recv()` returns `Err` (because the channel is closed and empty). Each worker breaks out of its loop and the thread exits. Then `join()` waits for each thread to finish.
 
-**Why `Option<Sender<Job>>`.** `Drop` must take the sender out to close the channel. Without `Option` the field cannot be moved in `Drop`; the `Option` lets `shutdown` call `self.job_tx.take()`.
+The `Option` wrapper on `job_tx` is necessary because `Drop` can't move a value out of a struct field without wrapping it. `take()` swaps in `None` and returns `Some(sender)`, which is then immediately dropped.
 
-**Why the worker wakes the executor via `mio::Waker` instead of a channel.** The executor is blocked inside `mio::Poll::poll`; only a registered wake source can unblock it. A message pushed to a channel would sit in memory with nobody reading it.
+This is also why the `ContextGuard` must drop *before* the runtime. The guard holds a clone of `job_tx`. If the guard were still alive when the pool tries to close the channel, the channel would have a live sender and workers would block forever in `recv()`.
 
-**Why the shared `job_rx` is wrapped in `Arc<Mutex<...>>`.** `mpsc::Receiver` is not `Clone`, but N workers must share one receiver. The `Mutex` serializes access; `recv()` blocks while holding the lock, which is safe because only one worker waits at a time and the channel is unbounded (so `send` never blocks).
+## Design Choices
 
-**What `BlockingId` maps to.** The waker stored in `RuntimeState::blocking_wakers` under that key. The mapping is how "a job finished" becomes "poll exactly this task".
+**Why two channels?** The job channel carries closures: one producer, many consumers. The completed channel carries ids: many producers, one consumer. They're different directions, different types, and different purposes. Merging them would force every worker to consume every other worker's results — wasteful and confusing.
 
-**When this changes.** A multi-threaded executor would give each thread its own pool or use work-stealing. Dynamic sizing, job cancellation, or per-job timeouts would change the design.
+**Why `catch_unwind` in the worker loop?** A panicking closure must not kill the worker. A dead worker permanently reduces capacity. The worker catches the panic, the payload gets shipped back through the per-job result channel, and `resume_unwind` re-raises it on the executor thread where the awaiting task can handle it.
 
-## 4. Failure Modes and Misconceptions
+**Why `mio::Waker` and not another channel?** The executor is parked inside `mio::Poll::poll`. A message pushed to a regular channel would sit in memory with nobody reading it. Only a registered wake source (like `mio::Waker`) can unblock the executor from inside the kernel.
 
-### What Breaks If Implemented Wrong
+**Why `Arc<Mutex<Receiver>>` for the job channel?** The receiver isn't `Clone`, but all workers must share it. The `Mutex` serializes access, and since `recv()` blocks while holding the lock, only one worker waits at a time. The lock is never contended — a worker releases it only to do actual work.
 
-**A worker thread panicked without the `catch_unwind` guard.** The worker dies mid-loop, its `JoinHandle` is never joined cleanly, and every future job sent to that worker's slot is stranded — the runtime would hang. Both catch layers exist: the worker's `catch_unwind` (defense-in-depth) and the job closure's `catch_unwind` (ships the payload back).
+## Common Misconceptions
 
-**A `BlockingTask` is dropped without removing its waker.** The entry stays in `blocking_wakers`; `is_done` never sees an empty map; `run()` never returns. The test `dropped_spawn_blocking_leaves_blocking_map_empty` guards this: it polls a `BlockingTask`, drops it, and asserts the map is empty.
+**"Workers poll futures."** Workers run closures only. They have no `Future`, no `Context`, no `Waker`. They call a `FnOnce` and send the result back. The executor is the only thing that polls.
 
-**A sender to the job channel survives `shutdown`.** If the thread-local context still holds a clone of `job_tx` when `Drop` runs, `recv()` never returns `Err`, and `join()` blocks forever. This is why the `ContextGuard` must be declared *after* the runtime in `Mar::run`: locals drop in reverse order, so the guard drops first, releasing the sender clone before the pool joins.
+**"The worker wakes the blocked task directly."** The worker wakes the *executor* via `mio::Waker`. The executor then looks up the `BlockingId` in `blocking_wakers` and wakes the specific task. The worker has no idea which task is waiting.
 
-### Common Misunderstandings
+**"The completed channel carries results."** It carries `BlockingId`s — just numbers that say "job N is done." The actual result travels through the per-job result channel, which is private to each `BlockingTask` future.
 
-**"Workers poll futures."** Workers run closures only. They have no `Future` trait machinery, no `Context`, no `Waker`. They run a `FnOnce` and send the result back.
+**"A panicking closure swallows the panic."** The panic payload is shipped through the per-job result channel and re-raised on the executor thread via `resume_unwind`. The panic surfaces in the task that awaited the `BlockingTask`, exactly where it is expected.
 
-**"The worker wakes the blocked task."** The worker wakes the *executor*, via `mio::Waker`. The executor then wakes the specific task via the `BlockingId` lookup in `blocking_wakers`. The worker does not know which task is waiting.
+**"Spawning a blocking task wakes every blocked task."** Each completion wakes exactly one task — the one whose `BlockingId` matches. The lookup in `blocking_wakers` is precise.
 
-**"The completed channel carries results."** It carries `BlockingId`s. The result channel is per-job and private to the `BlockingTask` future. The two channels serve different purposes: the completed channel is the "something finished" signal; the result channel carries the actual value.
+## Summary
 
-**"A panicking closure is swallowed."** Its payload is shipped through the per-job result channel and re-raised on the executor thread via `resume_unwind`. The panic surfaces in the task that awaited the `BlockingTask`.
+The `WorkerPool` runs blocking closures on a fixed set of OS threads so the executor thread stays responsive. Two channels carry work in opposite directions: closures from executor to workers, completion ids from workers back to executor. `BlockingTask` bridges sync and async: it wraps the per-job result channel and registers a waker so the executor knows which task to wake when the job finishes. Its `Drop` removes the waker entry to prevent the runtime from hanging if the task is cancelled. And the `ContextGuard`'s drop order — before the pool — is the detail that makes clean shutdown possible.
 
-**"Each job wakes every blocked task."** Each job's completion wakes only its own task. The `BlockingId` lookup in `blocking_wakers` is precise — it finds the exact waker for the task that submitted the job.
-
-## 5. Summary
-
-- The `WorkerPool` runs blocking closures on a fixed set of OS threads so the executor thread is never blocked.
-- `Job` is a type-erased `Box<dyn FnOnce()>`; each job gets a per-job result channel for its value or panic payload.
-- Two channels: the job channel (executor→workers) and the completed channel (workers→executor, carrying `BlockingId`s).
-- Workers wake the executor via `mio::Waker`, which unblocks the parked `mio::Poll::poll`.
-- `BlockingTask` bridges sync and async: first poll submits, later poll reads the result.
-- `BlockingTask::Drop` removes the waker entry to prevent `is_done` from hanging.
-- The `ContextGuard` must drop before the pool to prevent a join deadlock.
+Source: `src/task/worker_pool.rs`, `src/task/blocking.rs`

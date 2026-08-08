@@ -1,46 +1,26 @@
-# TimerRegistry: Deadline Tracking and Async Timers
+# TimerRegistry: How Async Sleep Works
 
-## 1. Concept: What Are Async Timers?
+## Sleeping Without Blocking
 
-### The Core Concept
+Code needs to wait for one second before continuing. `time::sleep(Duration::from_secs(1))` is called, and the mental model says the world pauses for one second while the rest of the program keeps going. That's the promise of async — tasks yield cooperatively without freezing the whole system. But the machine doesn't understand "wait a second" on its own. It needs a mechanism, and not every mechanism works.
 
-An async timer registers a deadline with the runtime and returns `Pending`. The thread keeps running other tasks until the deadline passes, when the runtime wakes the task. `std::thread::sleep` blocks the whole thread — the executor can run nothing else while a task sleeps, which defeats async entirely. In async code, "sleep" must mean: register a deadline, return `Pending`, and get woken later.
+The obvious but catastrophic approach is `std::thread::sleep`. It does exactly what it says: it puts the entire thread to sleep inside the kernel. For a single-threaded async runtime, that means the executor itself goes to sleep. Task polling stops. The timer registry stops. The reactor stops. Every parked task that was waiting for an I/O event or a worker thread freezes alongside the one that wanted the delay, because they all share the same thread and that thread is now unconscious for a full second. Cooperative scheduling has been traded for a hard freeze, and nothing in the runtime can stop it because there's no preemption — it's a cooperative system and the programmer just refused to cooperate.
 
-### The Problem
+The correct approach is to decouple the desire from the waiting. Instead of blocking the thread, the deadline is registered with the runtime, the waker is handed over, and `Pending` is returned. The executor keeps running other tasks while the second passes. When the deadline arrives, the runtime notices and wakes the task. The code experiences the passage of time, but the runtime never stops. This is what the timer registry makes possible — asynchronous waiting that doesn't block, backed by the same OS machinery that already handles I/O.
 
-Consider a task that needs to wait one second:
+## The Idea
 
-```rust
-std::thread::sleep(Duration::from_secs(1));
-```
+A registry of `(deadline, waker)` entries. Nothing fancy — no timer wheel, no priority queue, just a flat list. The executor checks it every iteration:
 
-This parks the entire executor thread for one second. No other task runs. No timers fire. No I/O is processed. The executor is frozen. The thread is doing nothing useful — it is blocked in the kernel, waiting for a clock interrupt. This is the opposite of what an async runtime needs.
+1. **Is there a timer?** → Find the earliest deadline.
+2. **How long until then?** → Compute the remaining duration.
+3. **Park the thread for that long.** → The OS itself handles the wait via the reactor's timeout mechanism.
+4. **Deadline passed?** → Collect the expired entries, wake their tasks.
+5. **Repeat.**
 
-The runtime needs a mechanism where a task says "wake me in one second," the runtime records that request, and the thread continues running other work. When the second passes, the runtime wakes exactly that task.
+No dedicated timer thread. No busy-waiting. The OS's `epoll_wait` timeout *is* the timer mechanism. The runtime piggybacks on the same system call that handles I/O multiplexing.
 
-### The Solution Shape
-
-A registry of `(deadline, waker)` entries. The executor needs to know the *earliest* deadline so it can park the thread until then. When time passes, the expired entries' wakers fire and their tasks re-poll. The executor does not need a dedicated timer thread or a timer wheel — it recomputes the park timeout each iteration from the current earliest deadline.
-
-### How `sleep()` Composes
-
-`time::sleep(d)` returns a `Sleep` future. On the first poll: if the deadline has already passed, return `Ready`; otherwise register `(deadline, waker)` in the registry and return `Pending`. A later poll — after the executor expired the deadline and woke the task — sees `Instant::now() >= deadline` and returns `Ready`. The future is a two-state machine: "waiting" and "done".
-
-An `Instant` is a monotonic clock timestamp from the standard library. It is unaffected by wall-clock changes, NTP adjustments, or daylight saving time. Subtracting two `Instant` values always gives the real elapsed time, which is why `deadline.saturating_duration_since(Instant::now())` is safe.
-
-### The Poll-Timeout Coupling
-
-The executor's park timeout is not fixed. Each iteration, `compute_timeout` calls `wheel.next_deadline()` to get the earliest `Instant`, then computes the remaining duration. If no timers exist, the timeout is `None` (park forever until an I/O event). If a deadline passed during the drain, the timeout is `Duration::ZERO` (don't park at all — fire the timer immediately). Otherwise it is `Some(remaining)`. This coupling means the runtime waits for timers without a dedicated timer thread — the OS's own timeout mechanism does the waiting.
-
-### Precision
-
-Timers never fire *before* their deadline — `expire_due` checks `deadline <= now`, so an entry whose deadline is one nanosecond in the future survives the scan. Timers may fire up to one event-loop-iteration late: if the executor is busy polling tasks, it does not check timers until the drain finishes. This bounded lateness is correct — the contract is "at least this long," not "exactly this long."
-
-## 2. How This Runtime Implements TimerRegistry
-
-### The Struct
-
-`src/time/timer_registry.rs`:
+## The Struct
 
 ```rust
 pub(crate) struct TimerRegistry {
@@ -55,21 +35,19 @@ struct TimerEntry {
 }
 ```
 
-### Field by Field
+**`entries`** — an unsorted list of pending timers. Each entry is a deadline, a registry-local id, and the waker of the task that should be notified when the deadline arrives. The list is unsorted because appends are O(1) and the only operations that need ordering are `next_deadline` (scan for minimum) and `expire_due` (scan for expired). For the typical number of concurrent timers this runtime handles — dozens, not thousands — the scan is fast enough.
 
-**`entries: RefCell<Vec<TimerEntry>>`.** An unsorted list of pending timers. `RefCell` provides interior mutability on a single thread — `push` and `expire_due` call `borrow_mut()`, `is_empty` and `next_deadline` call `borrow()`. The `Vec` is unsorted because appends are O(1) and the registry only needs ordering when it scans (for `next_deadline` and `expire_due`). Keeping it unsorted avoids the cost of maintaining sorted order on every insert.
+**`next_id`** — a counter for registry-local ids. This id is separate from `TaskId`. One task can have multiple `Sleep` futures active at once (for example, a `select!` racing two different timeouts). The registry needs its own identity space to tell these entries apart.
 
-**`next_id: Cell<usize>`.** A counter for registry-local ids. `Cell` provides interior mutability for `Copy` types without runtime borrow checking — `get()` reads and `set()` writes, with no possibility of a double-borrow panic. The counter starts at 0 and increments on every `push`.
+**`TimerEntry::deadline`** — an `Instant`. `Instant` is Rust's monotonic clock — it only moves forward and isn't affected by NTP adjustments, daylight saving time, or someone changing the system clock. Subtracting two `Instant`s always gives the real elapsed time.
 
-**`TimerEntry::deadline: Instant`.** The time at which this timer expires. `Instant` is a monotonic timestamp — it only moves forward and is not affected by system clock changes.
+**`TimerEntry::id`** — assigned by `push`, used by `Sleep::Drop` for cancellation. When a `Sleep` future is dropped before its deadline fires (because the task was cancelled or a `select!` chose a different branch), it calls `remove(id)` to clean itself up.
 
-**`TimerEntry::id: usize`.** Assigned by `push`, used by `Sleep::Drop` for cancellation. This id is registry-local, not a `TaskId`. One task can have multiple simultaneous `Sleep` futures — for example, `select!` racing two timers — so the registry needs its own identity space to distinguish entries.
+**`TimerEntry::waker`** — the task's waker, cloned from the `Context` during `Sleep::poll`. When the deadline passes, the registry calls `wake_by_ref()` on this, pushing the task's id onto the ready queue.
 
-**`TimerEntry::waker: Waker`.** The task's waker, stored so `expire_due` can wake the task directly when the deadline passes. The waker was cloned from the `Context` during `Sleep::poll`.
+## The Operations
 
-### Core Methods
-
-**`push`:**
+### `push` — Register a Timer
 
 ```rust
 pub(crate) fn push(&self, deadline: Instant, waker: Waker) -> usize {
@@ -80,9 +58,9 @@ pub(crate) fn push(&self, deadline: Instant, waker: Waker) -> usize {
 }
 ```
 
-Reads the current id, increments it, appends the entry, returns the id. The caller (`Sleep::poll`) stores the id so it can call `remove` later.
+Read the next id, increment, append the entry, return the id. The caller (`Sleep::poll`) stores the returned id so it can cancel the entry later.
 
-**`remove`:**
+### `remove` — Cancel a Timer
 
 ```rust
 pub(crate) fn remove(&self, target_id: usize) {
@@ -90,9 +68,9 @@ pub(crate) fn remove(&self, target_id: usize) {
 }
 ```
 
-Removes all entries whose id matches `target_id`. `retain` is O(n) — it scans the entire vector. This is called by `Sleep::Drop` and is acceptable because timer counts are small.
+Remove all entries matching an id. O(n) scan, but it's only called on drop/cancellation, and timer counts are small.
 
-**`is_empty`:**
+### `is_empty` — Is There Any Pending Timer?
 
 ```rust
 pub(crate) fn is_empty(&self) -> bool {
@@ -100,9 +78,9 @@ pub(crate) fn is_empty(&self) -> bool {
 }
 ```
 
-Feeds the executor's termination check. `is_done` in `Mar::run` requires the registry to be empty before the runtime can return.
+Feeds directly into `is_done` in the executor loop. The runtime can't return while timers are pending — that would mean dropping timers before their tasks had a chance to complete.
 
-**`next_deadline`:**
+### `next_deadline` — How Long Until the Next Timer?
 
 ```rust
 pub(crate) fn next_deadline(&self) -> Option<Instant> {
@@ -110,9 +88,9 @@ pub(crate) fn next_deadline(&self) -> Option<Instant> {
 }
 ```
 
-Linear scan for the minimum deadline. Returns `None` if the registry is empty. The executor turns this into a timeout: `deadline.saturating_duration_since(Instant::now())` produces `Duration::ZERO` (overdue), `Some(duration)` (remaining time), or the `None` propagates as "park forever."
+Linear scan for the earliest deadline. Returns `None` if no timers exist. The executor turns this into a reactor timeout: if it's `None`, park forever. If it's some `Instant`, compute `deadline.saturating_duration_since(Instant::now())` — the result is the park duration, or `Duration::ZERO` if the deadline already passed.
 
-**`expire_due`:**
+### `expire_due` — Fire Expired Timers
 
 ```rust
 pub(crate) fn expire_due(&self) {
@@ -122,25 +100,25 @@ pub(crate) fn expire_due(&self) {
     entries.retain(|e| {
         if e.deadline <= now {
             due.push(e.waker.clone());
-            false
+            false  // remove from entries
         } else {
-            true
+            true   // keep
         }
     });
-    drop(entries);
+    drop(entries);  // release the borrow BEFORE waking
     for w in due {
         w.wake_by_ref();
     }
 }
 ```
 
-Two-phase expiry. Phase one: borrow the entries, scan the full list, collect the wakers of every entry whose deadline has passed, and `retain` only the unexpired entries. Phase two: `drop(entries)` releases the `RefCell` borrow, *then* calls `wake_by_ref()` on each collected waker.
+Two phases. Phase one: borrow the entries, scan everything, collect the wakers of expired entries, and retain only the unexpired ones. Phase two: drop the borrow, *then* wake each waker.
 
-The borrow must be released before waking. `wake_by_ref()` runs the `Wake` impl, which pushes the task's id onto the ready queue. If the executor is running `expire_due` from inside `Mar::run`, the `RefCell` on `RuntimeState` is not currently borrowed, so the push succeeds. But if a waker's code re-entered the timer registry — for example, a future that calls `sleep` inside its `poll` when woken — it would call `borrow_mut()` on the same `RefCell`. If the entries borrow were still held, this would panic. The collect-then-wake split makes the borrow window explicit and tiny.
+The order matters. `wake_by_ref()` runs the waker's `Wake` impl, which pushes a task id onto the ready queue. If a waker's code re-entered the timer registry — for instance, a `Sleep`'s enclosing task called another `sleep` inside its poll — it would try to `borrow_mut()` the same `RefCell`. If the borrow from phase one were still held, that would panic. The collect-then-wake split makes the borrow window explicit and tiny, so re-entrancy is always safe.
 
-### The Consumer: `Sleep`
+## The Consumer: `Sleep`
 
-`src/time/sleep.rs`:
+`Sleep` is the future that `time::sleep(d)` returns:
 
 ```rust
 pub struct Sleep {
@@ -151,15 +129,15 @@ pub struct Sleep {
 }
 ```
 
-**`registry: Rc<TimerRegistry>`.** A reference-counted handle to the shared timer registry, cloned from the `ContextHandle` by `sleep()`.
+**`registry`** — a handle to the shared timer registry, cloned from the thread-local context when `sleep()` is called.
 
-**`deadline: Instant`.** When this timer expires. Set to `Instant::now() + duration` at construction.
+**`deadline`** — `Instant::now() + duration`, computed at construction.
 
-**`id: Option<usize>`.** The registry-assigned id, set on first `poll`. `None` before the first poll — the entry is not registered until the future is actually polled.
+**`id`** — the registry-assigned id. `None` before the first poll — the entry isn't registered until the future is actually polled. This means `sleep(d)` never touches the registry unless it's inside `Mar::run` and actually `.await`ed.
 
-**`done: bool`.** Guard against polling after completion. Once `Ready` is returned, subsequent polls return `Ready` immediately.
+**`done`** — guards against polling after completion. Once a `Sleep` returns `Ready`, subsequent polls return `Ready` immediately.
 
-**`Sleep::poll`:**
+### `Sleep::poll`
 
 ```rust
 fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -177,9 +155,14 @@ fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
 }
 ```
 
-The `done` guard handles polling after completion. The deadline check handles `sleep(Duration::ZERO)` — the first poll sees the deadline already passed and returns `Ready` without touching the registry. On the first poll (when `id` is `None`), the future registers itself: calls `registry.push(deadline, cx.waker().clone())`, stores the returned id, and returns `Pending`. On subsequent polls, the id is already set, so it just returns `Pending` — the entry is already registered.
+Three branches, checked in order:
 
-**`Sleep::Drop`:**
+1. Already done? Return `Ready`.
+2. Deadline passed already? (Happens with `sleep(Duration::ZERO)` or if the deadline came and went before this poll.) Return `Ready`.
+3. Not registered yet? Register `(deadline, waker)` in the registry, store the id, return `Pending`.
+4. Already registered? Just return `Pending` — the entry is already in the registry.
+
+### `Sleep::Drop`
 
 ```rust
 impl Drop for Sleep {
@@ -191,81 +174,54 @@ impl Drop for Sleep {
 }
 ```
 
-The cancellation trap. If a `Sleep` is dropped before its deadline fires — because the task was cancelled, or a `select!` chose a different branch — the entry must be removed from the registry. If the entry were left behind, the registry would never be empty, `is_done` would never pass, and `run()` would never return. `Drop` exists to prevent this; it is a termination requirement, not an optimization. The test `dropped_sleep_removes_itself_from_heap` in `src/time/sleep.rs` guards this invariant: it polls a `Sleep` once (inserting the entry), drops it, and asserts the registry is empty.
+This is critical. If a `Sleep` is dropped before its deadline fires — because the task was cancelled, or a `select!` chose a timeout instead — the entry must be removed from the registry. A dead entry in the registry means the registry is never empty, `is_done` never passes, and `run()` hangs forever. This `Drop` impl is not an optimization; it's a termination requirement.
 
-### `sleep(d)`
+## Walking Through a Timer
 
-```rust
-pub fn sleep(duration: Duration) -> Sleep {
-    let registry = crate::context::with(|ctx| ctx.wheel.clone());
-    Sleep {
-        registry,
-        deadline: Instant::now() + duration,
-        id: None,
-        done: false,
-    }
-}
-```
+Let's trace `sleep(Duration::from_secs(1))` from start to finish:
 
-Calls `context::with` to read the `ContextHandle` from the thread-local, clones the `wheel` field (the `Rc<TimerRegistry>`), and builds the `Sleep`. `sleep(Duration::ZERO)` is valid: the first poll sees `Instant::now() >= deadline` and returns `Ready` without ever touching the registry.
+**t₀: Construction.** `sleep(1s)` reads the thread-local context, clones the timer registry, and returns `Sleep { deadline: now + 1s, id: None, done: false }`.
 
-### Worked Example
+**t₁: First poll.** The executor polls the task containing this `Sleep`. `Sleep::poll`: deadline not reached, id is `None`, so it calls `registry.push(deadline, waker)`. The registry appends entry id 0. `Pending` returned.
 
-Trace `sleep(Duration::from_secs(1))` with concrete values.
+**t₂: Drain ends.** The ready queue is empty. `is_done` sees the task table has the parked task and the registry has one entry. Not done.
 
-**t₀: Construction.** `Instant::now()` returns `t₀`. `sleep(1s)` returns `Sleep { deadline: t₀ + 1s, id: None, done: false }`.
+**t₃: Park.** `compute_timeout` calls `next_deadline()`, gets `Some(t₀ + 1s)`. Timeout is roughly `Some(1s)`. The reactor blocks the thread for ~1 second.
 
-**t₁: First poll.** `Sleep::poll` runs. `done` is `false`. `Instant::now()` is `t₀ + ~0ms`, which is `< t₀ + 1s`. `id` is `None`, so `registry.push(t₀ + 1s, waker_clone)` is called. The registry appends `TimerEntry { deadline: t₀ + 1s, id: 0, waker }`. The id `0` is stored. `Pending` is returned. State: registry has one entry (id `0`, deadline `t₀ + 1s`).
+**t₄: Timer fires.** `fire_due_timers` calls `expire_due()`. The entry's deadline is `<= now`. Its waker is collected, the entry removed, and `wake_by_ref()` pushes the task's id onto the queue.
 
-**t₂: `is_done` check.** The registry is non-empty. `is_done` returns `false`.
+**t₅: Second poll.** The drain polls the task. `Sleep::poll`: `Instant::now() >= deadline`, so `done = true`, `Ready(())` returned. Task completes.
 
-**t₃: Park.** `compute_timeout` calls `wheel.next_deadline()`, which returns `Some(t₀ + 1s)`. The timeout is `(t₀ + 1s).saturating_duration_since(Instant::now())`, which is roughly `Some(1s)`. `reactor.poll` blocks the thread in the kernel for ~1 second.
+**t₆: Done.** The task is gone, registry is empty. `is_done` passes.
 
-**t₄: Timer fires.** `fire_due_timers` calls `wheel.expire_due()`. `Instant::now()` is now `t₀ + ~1s`. The entry's deadline `t₀ + 1s <= now`, so its waker is collected, the entry is removed, and `wake_by_ref()` pushes the task's id onto the ready queue. State: registry empty.
+## Precision Guarantees
 
-**t₅: Second poll.** `drain_ready_queue` pops the task and polls. `Sleep::poll`: `Instant::now() >= deadline`, so `done = true` and `Ready(())` is returned. The task completes.
+Timers never fire *before* their deadline. `expire_due` checks `deadline <= now`, so an entry whose deadline is one nanosecond in the future survives the scan and waits for the next iteration.
 
-### Source Links
+Timers may fire *after* their deadline, bounded by one event-loop iteration. If the executor is busy polling tasks for 50ms after a deadline passes, the timer fires 50ms late. This bounded lateness is acceptable — the async contract is "wait at least this long," not "fire exactly at this nanosecond."
 
-- `src/time/timer_registry.rs` — `TimerRegistry`, `TimerEntry`, `push`, `remove`, `is_empty`, `next_deadline`, `expire_due`
-- `src/time/sleep.rs` — `Sleep`, `Sleep::poll`, `Sleep::Drop`, `sleep()`
-- `src/mar.rs` — `compute_timeout`, `fire_due_timers`
+## Design Choices
 
-## 3. Design Decisions
+**Why a `Vec` instead of a `BinaryHeap`?** A heap gives O(log n) push and O(log n) min-extract. But `expire_due` needs to find *all* expired entries, not just the minimum — that's still O(n) in a heap unless entries are popped repeatedly. For the small timer counts this runtime handles (dozens, not thousands), the flat `Vec` keeps the code simple and readable. The choice would change at scale.
 
-**Why `Vec` and not a `BinaryHeap`.** A binary heap gives O(log n) push and O(log n) min-extract, but the code needs full scans for `expire_due` — which must find *all* expired entries, not just the minimum. A heap's advantage applies only to `next_deadline`, and even there the improvement is marginal. N is small in practice (dozens of timers); the `Vec` keeps the code simple. This would change at thousands of concurrent timers, where the O(n) scans dominate.
+**Why `RefCell` and not `Mutex`?** The timer registry is only accessed from the executor thread. `RefCell` panics loudly on misuse; `Mutex` would add locking overhead and hide bugs as silent deadlocks.
 
-**Why wakers are called after the reactor poll, not during it.** `expire_due` runs after `poll_readiness_events` returns. The two-phase collect-then-wake avoids holding the `RefCell` borrow across `wake_by_ref` calls — a waker's code might re-enter the registry. Wakers run only after the thread has returned from the kernel, so the re-queued tasks are drained at the top of the next iteration.
+**What if a timer fires for a dropped task?** The waker pushes a stale id. The drain's lookup fails — `let Some(mut task) = ... else { continue; }` — and the id is skipped. Spurious wakes are harmless.
 
-**Why `RefCell` and not `Mutex`.** The timer registry is accessed only from the executor thread. A `Mutex` would add locking overhead and hide borrow-order bugs as deadlocks instead of panicking loudly.
+**What about `sleep(Duration::ZERO)`?** `Instant::now() >= deadline` is true on the first poll. `Ready` is returned immediately. The registry is never touched. No entry is created, no id is allocated.
 
-**What happens if a timer fires for a dropped task.** The waker pushes an id; the drain's `else { continue; }` skips the missing task. This is a spurious wake — harmless because wake is a no-op for a nonexistent task.
+## Common Misconceptions
 
-**When this changes.** Precision-critical timers would move to a separate timer thread or a timing wheel. A heap or a hierarchical timing wheel would serve high timer counts.
+**"Timers create sleeping threads."** Nothing sleeps but the executor's single park inside `mio::Poll::poll`. The timer registry is just a list in memory. The OS's timeout mechanism — the same `epoll_wait` call that handles I/O — does the actual waiting.
 
-## 4. Failure Modes and Misconceptions
+**"A timer fires exactly on time."** It fires at or after its deadline. A busy executor adds up to one iteration of lateness. It never fires early.
 
-### What Breaks If `Sleep::Drop` Did Not Remove Its Entry
+**"One timer per task."** One entry per `Sleep` future. A task with two concurrent sleeps (e.g., inside a `select!`) creates two entries with two different registry ids.
 
-The registry would never empty. `is_done` would require `wheel.is_empty()`, which would never hold. `run()` would hang forever, waiting for a timer that will never fire because the task that owned it is gone. The `dropped_sleep_removes_itself_from_heap` test guards this: it polls a `Sleep`, drops it, and asserts the registry is empty.
+**"The waker in the registry runs the task."** The waker pushes an id onto the ready queue. The executor picks it up and polls the task. The registry never touches the task directly.
 
-### What Breaks If `expire_due` Woke Wakers While Holding the Borrow
+## Summary
 
-A waker whose wake path re-entered the timer registry — a future that calls `sleep` inside its `poll` when woken — would call `borrow_mut()` on the same `RefCell` while the entries borrow is held. The `RefCell` would panic with a borrow error. The collect-then-wake split prevents this.
+The `TimerRegistry` is a flat list of `(deadline, id, waker)` entries. `Sleep` is the future that registers an entry on first poll and removes it on drop (to prevent the runtime from hanging). The executor couples `next_deadline` to the reactor's park timeout, so the OS's own wait mechanism handles timer expiration — no dedicated timer thread, no busy-waiting. `expire_due` uses a collect-then-wake pattern to safely fire wakers without holding a borrow.
 
-### Common Misunderstandings
-
-**"Timers create sleeping threads."** Nothing sleeps but the executor's single park inside `mio::Poll::poll`. The timer registry is a list of entries in memory; the OS's timeout mechanism does the actual waiting.
-
-**"A timer fires exactly on time."** It fires at or after its deadline, bounded by one event-loop iteration. If the executor is busy polling tasks for 50ms after a deadline passes, the timer fires 50ms late. It never fires early.
-
-**"One timer entry per task."** One entry per `Sleep` future, identified by the registry's own id. A task with two concurrent `Sleep` futures has two entries.
-
-**"`sleep(0)` registers a timer."** `sleep(Duration::ZERO)` completes on the first poll. `Instant::now() >= deadline` holds immediately, so `Ready` is returned without ever touching the registry.
-
-## 5. Summary
-
-- The `TimerRegistry` is an unsorted `Vec` of `(deadline, id, waker)` entries that tracks when async timers expire.
-- `Sleep` is the future that registers entries on first poll and returns `Ready` when the deadline passes. Its `Drop` removes the entry to prevent the registry from never emptying.
-- `expire_due` collects expired wakers and wakes them after releasing the borrow, to avoid double-borrow panics.
-- The executor couples the registry to its park timeout via `next_deadline`, so the thread blocks in the kernel until the earliest timer is due.
+Source: `src/time/timer_registry.rs`, `src/time/sleep.rs`
