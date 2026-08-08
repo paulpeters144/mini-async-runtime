@@ -1,5 +1,4 @@
 use crate::runtime_state::TaskId;
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::task::{Wake, Waker};
 
@@ -15,20 +14,22 @@ use std::task::{Wake, Waker};
 /// `Waker::from(Arc<T>)` also requires `T: Send + Sync`, so the queue uses
 /// `Mutex` instead of `RefCell`. The lock is always uncontended (the runtime
 /// is single-threaded), making `lock().unwrap()` a trivial operation.
-struct TaskWaker {
-    queue: Arc<Mutex<VecDeque<TaskId>>>,
+pub struct TaskWaker {
+    queue: Arc<Mutex<Vec<TaskId>>>,
     id: TaskId,
+}
+
+impl TaskWaker {
+    /// Build a `Waker` that, when woken, pushes `id` into the shared ready queue.
+    pub fn new(queue: Arc<Mutex<Vec<TaskId>>>, id: TaskId) -> Waker {
+        Waker::from(Arc::new(TaskWaker { queue, id }))
+    }
 }
 
 impl Wake for TaskWaker {
     fn wake(self: Arc<Self>) {
-        self.queue.lock().unwrap().push_back(self.id);
+        self.queue.lock().unwrap().push(self.id);
     }
-}
-
-/// Create a `Waker` that, when woken, pushes `id` into the shared ready queue.
-pub fn create_waker(queue: Arc<Mutex<VecDeque<TaskId>>>, id: TaskId) -> Waker {
-    Waker::from(Arc::new(TaskWaker { queue, id }))
 }
 
 // ---------------------------------------------------------------------------
@@ -46,10 +47,10 @@ mod tests {
     /// and confirm the id appears exactly once.
     #[test]
     fn wake_pushes_id_to_queue() {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let waker = create_waker(queue.clone(), TaskId(7));
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let waker = TaskWaker::new(queue.clone(), TaskId(7));
         waker.wake();
-        assert_eq!(queue.lock().unwrap().clone(), VecDeque::from([TaskId(7)]));
+        assert_eq!(queue.lock().unwrap().clone(), vec![TaskId(7)]);
     }
 
     /// `waker.wake()` *consumes* the waker, but `wake_by_ref` borrows it so
@@ -59,13 +60,13 @@ mod tests {
     /// the same waker and expects two entries in the queue.
     #[test]
     fn wake_by_ref_is_reusable() {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let waker = create_waker(queue.clone(), TaskId(7));
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let waker = TaskWaker::new(queue.clone(), TaskId(7));
         waker.wake_by_ref();
         waker.wake_by_ref();
         assert_eq!(
             queue.lock().unwrap().clone(),
-            VecDeque::from([TaskId(7), TaskId(7)])
+            vec![TaskId(7), TaskId(7)]
         );
     }
 
@@ -76,14 +77,14 @@ mod tests {
     /// verifies they agree on the task identity.
     #[test]
     fn clone_shares_identity() {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let waker = create_waker(queue.clone(), TaskId(7));
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let waker = TaskWaker::new(queue.clone(), TaskId(7));
         let clone = waker.clone();
         waker.wake();
         clone.wake();
         assert_eq!(
             queue.lock().unwrap().clone(),
-            VecDeque::from([TaskId(7), TaskId(7)])
+            vec![TaskId(7), TaskId(7)]
         );
     }
 
@@ -94,9 +95,9 @@ mod tests {
     /// checks that both ids land in the queue.
     #[test]
     fn different_ids_share_queue() {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let a = create_waker(queue.clone(), TaskId(1));
-        let b = create_waker(queue.clone(), TaskId(2));
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let a = TaskWaker::new(queue.clone(), TaskId(1));
+        let b = TaskWaker::new(queue.clone(), TaskId(2));
         a.wake();
         b.wake();
         let mut drained: Vec<_> = std::mem::take(&mut *queue.lock().unwrap()).into();
@@ -116,8 +117,8 @@ mod tests {
     /// id still lands in the queue.
     #[test]
     fn waker_keeps_queue_alive() {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let waker = create_waker(queue.clone(), TaskId(99));
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let waker = TaskWaker::new(queue.clone(), TaskId(99));
         drop(queue); // runtime's reference gone
         waker.wake(); // still works — the waker holds an Arc
         // the wake succeeded — queue wasn't freed because the waker held it.

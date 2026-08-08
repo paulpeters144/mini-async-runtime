@@ -86,8 +86,7 @@ impl TimerRegistry {
 mod tests {
     use super::*;
     use crate::runtime_state::TaskId;
-    use crate::waker::create_waker;
-    use std::collections::VecDeque;
+    use crate::waker::TaskWaker;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -112,18 +111,18 @@ mod tests {
     // past waker lands in the queue and the future entry remains.
     #[test]
     fn expire_due_wakes_only_expired_entries() {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let queue = Arc::new(Mutex::new(Vec::new()));
         let heap = TimerRegistry::new();
 
-        let waker_past = create_waker(queue.clone(), TaskId(10));
-        let waker_future = create_waker(queue.clone(), TaskId(20));
+        let waker_past = TaskWaker::new(queue.clone(), TaskId(10));
+        let waker_future = TaskWaker::new(queue.clone(), TaskId(20));
 
         heap.push(Instant::now() - Duration::from_secs(1), waker_past);
         heap.push(Instant::now() + Duration::from_secs(1000), waker_future);
 
         heap.expire_due();
 
-        assert_eq!(*queue.lock().unwrap(), VecDeque::from([TaskId(10)]));
+        assert_eq!(*queue.lock().unwrap(), vec![TaskId(10)]);
         assert!(!heap.is_empty());
         assert!(heap.next_deadline().is_some());
     }

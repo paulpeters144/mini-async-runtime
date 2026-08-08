@@ -15,7 +15,7 @@ classDiagram
     }
 
     class RuntimeState {
-        queue: Arc~Mutex~VecDeque~TaskId~~~
+        queue: Arc~Mutex~Vec~TaskId~~
         tasks: HashMap~TaskId, Task~
         next_id: TaskId
         blocking_wakers: HashMap~BlockingId, Waker~
@@ -36,7 +36,7 @@ classDiagram
     }
 
     class TaskWaker {
-        queue: Arc~Mutex~VecDeque~TaskId~~~
+        queue: Arc~Mutex~Vec~TaskId~~
         id: TaskId
     }
 

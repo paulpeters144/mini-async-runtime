@@ -1,6 +1,6 @@
 use crate::task::Task;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
@@ -12,7 +12,7 @@ pub struct TaskId(pub usize);
 pub struct BlockingId(pub usize);
 
 pub struct RuntimeState {
-    pub queue: Arc<Mutex<VecDeque<TaskId>>>,
+    pub queue: Arc<Mutex<Vec<TaskId>>>,
     pub tasks: HashMap<TaskId, Task>,
     pub next_id: TaskId,
     pub blocking_wakers: HashMap<BlockingId, Waker>,
@@ -22,7 +22,7 @@ pub struct RuntimeState {
 impl RuntimeState {
     pub fn new() -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(RuntimeState {
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+            queue: Arc::new(Mutex::new(Vec::new())),
             tasks: HashMap::new(),
             next_id: TaskId(0),
             blocking_wakers: HashMap::new(),

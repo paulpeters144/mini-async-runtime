@@ -4,7 +4,7 @@ use crate::runtime_state::RuntimeState;
 use crate::task::Task;
 use crate::task::worker_pool::WorkerPool;
 use crate::time::TimerRegistry;
-use crate::waker::create_waker;
+use crate::waker::TaskWaker;
 use std::cell::RefCell;
 use std::future::Future;
 use std::io::{self};
@@ -22,16 +22,21 @@ where
     let mut state = runtime.state.borrow_mut();
     let id = state.next_id;
     state.next_id.0 += 1;
-    let waker = create_waker(state.queue.clone(), id);
+    let waker = TaskWaker::new(state.queue.clone(), id);
     state.tasks.insert(id, Task::new(id, future, waker));
-    state.queue.lock().unwrap().push_back(id);
+    state.queue.lock().unwrap().push(id);
 }
 
 fn drain_ready_queue(runtime: &Mar) {
     loop {
         let next = {
             let state = runtime.state.borrow_mut();
-            state.queue.lock().unwrap().pop_front()
+            let mut queue = state.queue.lock().unwrap();
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
         };
         let Some(id) = next else {
             break;
@@ -284,7 +289,7 @@ fn dropped_spawn_blocking_leaves_blocking_map_empty() {
     let id = fut.id();
     let mut fut = Box::pin(fut);
 
-    let waker = create_waker(state.borrow().queue.clone(), TaskId(999));
+    let waker = TaskWaker::new(state.borrow().queue.clone(), TaskId(999));
     let mut cx = Context::from_waker(&waker);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
     assert!(state.borrow().blocking_wakers.contains_key(&id));

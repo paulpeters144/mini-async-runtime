@@ -79,7 +79,7 @@ mod tests {
     use super::*;
     use crate::mar::Mar;
     use crate::runtime_state::{RuntimeState, TaskId};
-    use crate::waker::create_waker;
+    use crate::waker::TaskWaker;
     use std::cell::Cell;
     use std::task::Context;
 
@@ -111,7 +111,7 @@ mod tests {
     fn dropped_sleep_removes_itself_from_heap() {
         let state = RuntimeState::new();
         let heap = Rc::new(TimerRegistry::new());
-        let waker = create_waker(state.borrow().queue.clone(), TaskId(1));
+        let waker = TaskWaker::new(state.borrow().queue.clone(), TaskId(1));
         let mut cx = Context::from_waker(&waker);
 
         let mut sleep_val = Sleep {

@@ -232,7 +232,7 @@ Type erasure through `dyn Future` means the executor can hold many different fut
 ### The ready queue
 
 ```rust
-pub queue: Arc<Mutex<VecDeque<TaskId>>>  // FIFO queue of task IDs
+pub queue: Arc<Mutex<Vec<TaskId>>>  // FIFO queue of task IDs
 pub tasks: HashMap<usize, Task>  // all live tasks
 ```
 
@@ -242,7 +242,7 @@ When a task returns `Ready`, it is removed from both the queue and the map. It c
 
 ```mermaid
 flowchart TD
-    Task["A future wrapped in a Task"] --> Queue["Ready queue<br/>(VecDeque&lt;usize&gt;)"]
+    Task["A future wrapped in a Task"] --> Queue["Ready queue<br/>(Vec&lt;usize&gt;)"]
     Queue --> Poll["Poll the future"]
     Poll -->|Ready| Done["Task discarded"]
     Poll -->|Pending| Parked["Task parked in HashMap<br/>waiting for waker"]
@@ -254,7 +254,13 @@ flowchart TD
 At the top of every loop iteration, the executor drains the ready queue:
 
 ```rust
-while let Some(id) = state.queue.lock().unwrap().pop_front() {
+loop {
+    let next = {
+        let state = runtime.state.borrow_mut();
+        let mut queue = state.queue.lock().unwrap();
+        if queue.is_empty() { None } else { Some(queue.remove(0)) }
+    };
+    let Some(id) = next else { break; };
     let Some(mut task) = state.tasks.remove(&id) else { continue; };
     let waker = task.waker().clone();
     let mut cx = Context::from_waker(&waker);
@@ -273,13 +279,13 @@ The waker is how the executor gets notified that a parked task might be ready. `
 
 ```rust
 struct TaskWaker {
-    queue: Arc<Mutex<VecDeque<TaskId>>>,
+    queue: Arc<Mutex<Vec<TaskId>>>,
     id: TaskId,
 }
 
 impl Wake for TaskWaker {
     fn wake(self: Arc<Self>) {
-        self.queue.lock().unwrap().push_back(self.id);
+        self.queue.lock().unwrap().push(self.id);
     }
 }
 ```
